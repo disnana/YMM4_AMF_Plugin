@@ -2426,8 +2426,11 @@ namespace
         }
 
         LogLine(state, L"drain async bitstreams");
-        for (size_t i = 0; i < state->asyncPending.size(); ++i)
+        const size_t depth = state->asyncPending.size();
+        const size_t start = depth > 0 ? state->asyncIndex % depth : 0;
+        for (size_t offset = 0; offset < depth; ++offset)
         {
+            const size_t i = (start + offset) % depth;
             if (state->asyncPending[i])
             {
                 LogLine(state, L"drain slot start=" + std::to_wstring(i));
@@ -2438,7 +2441,32 @@ namespace
                 LogLine(state, L"drain slot done=" + std::to_wstring(i));
             }
         }
+        state->asyncIndex = start;
         return true;
+    }
+
+    bool WaitForAsyncEvent(EncoderState* state, HANDLE eventHandle, const wchar_t* context)
+    {
+        if (!eventHandle)
+        {
+            return true;
+        }
+
+        LogLine(state, std::wstring(context) + L" start");
+        DWORD result = WaitForSingleObject(eventHandle, 5000);
+        if (result == WAIT_OBJECT_0)
+        {
+            LogLine(state, std::wstring(context) + L" done");
+            return true;
+        }
+        if (result == WAIT_TIMEOUT)
+        {
+            SetError(state, std::wstring(context) + L" timed out.");
+            return false;
+        }
+
+        SetError(state, std::wstring(context) + L" failed.");
+        return false;
     }
 
     bool TryInitAv1CodecPrivate(EncoderState* state)
@@ -2605,6 +2633,8 @@ namespace
             : state->config.rcParams.averageBitRate;
         state->config.gopLength = state->fps * 2;
         state->config.frameIntervalP = 1;
+        state->config.rcParams.enableLookahead = 0;
+        state->config.rcParams.lookaheadDepth = 0;
         if (state->fastPreset != 0)
         {
             state->initParams.enableSubFrameWrite = 1;
@@ -2705,7 +2735,6 @@ namespace
                 state->bitstream = createBitstream.bitstreamBuffer;
             }
         }
-
         return true;
     }
 
@@ -3240,9 +3269,13 @@ int NvencFinalize(void* handle)
             return 0;
         }
 
-        state->asyncPending[asyncSlot] = true;
         state->asyncIndex = (asyncSlot + 1) % state->asyncBitstreams.size();
         LogLine(state, L"encode EOS submitted (async)");
+        state->asyncPending[asyncSlot] = false;
+        if (!WaitForAsyncEvent(state, state->asyncEvents[asyncSlot], L"nvEnc async EOS wait"))
+        {
+            return 0;
+        }
         if (!DrainAsyncBitstreams(state))
         {
             return 0;
