@@ -97,9 +97,16 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
         {
             if (_encoderHandle != IntPtr.Zero)
             {
-                NvencNativeMethods.NvencFinalize(_encoderHandle);
+                var finalizeResult = NvencNativeMethods.NvencFinalize(_encoderHandle);
+                var finalizeError = finalizeResult == 0 ? GetNativeError() : string.Empty;
                 NvencNativeMethods.NvencDestroy(_encoderHandle);
                 _encoderHandle = IntPtr.Zero;
+                if (finalizeResult == 0)
+                {
+                    throw new InvalidOperationException(string.IsNullOrWhiteSpace(finalizeError)
+                        ? "NVENC 出力の終了処理に失敗しました。"
+                        : finalizeError);
+                }
             }
         }
     }
@@ -119,7 +126,12 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
 
         var fps = Math.Max(1, _videoInfo.FPS);
         var bitrate = GetTargetBitrateKbps();
-        var codec = _settings.Codec == NvencCodec.H265 ? 1 : 0;
+        var codec = _settings.Codec switch
+        {
+            NvencCodec.H265 => 1,
+            NvencCodec.AV1 => 2,
+            _ => 0,
+        };
         var quality = (int)_settings.Quality;
         var rateControl = _settings.RateControl == NvencRateControl.Variable ? 1 : 0;
         if (_settings.RateControl == NvencRateControl.YouTubeRecommended)
@@ -143,7 +155,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
             rateControl,
             maxBitrate,
             bufferFormat,
-            _settings.HevcAsync ? 1 : 0,
+            _settings.HevcAsync && _settings.Codec == NvencCodec.H265 ? 1 : 0,
             _settings.EnableDebugLog ? 1 : 0,
             _outputPath);
 
