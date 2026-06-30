@@ -27,6 +27,10 @@
 
 namespace
 {
+    constexpr int kCodecH264 = 0;
+    constexpr int kCodecHevc = 1;
+    constexpr int kCodecAv1 = 2;
+
     struct FileWriter
     {
         HANDLE handle = INVALID_HANDLE_VALUE;
@@ -222,7 +226,7 @@ namespace
         uint64_t frameIndex = 0;
         bool writerInitialized = false;
         bool mp4Finalized = false;
-        bool isHevc = false;
+        int codec = kCodecH264;
         FileWriter file;
         uint64_t mdatHeaderOffset = 0;
         uint64_t mdatLargeSizeOffset = 0;
@@ -252,8 +256,23 @@ namespace
         HANDLE logFile = INVALID_HANDLE_VALUE;
     };
 
+    bool IsHevc(const EncoderState* state)
+    {
+        return state && state->codec == kCodecHevc;
+    }
+
+    bool IsAv1(const EncoderState* state)
+    {
+        return state && state->codec == kCodecAv1;
+    }
+
+    struct Av1SequenceHeaderInfo;
+    bool ExtractAv1SequenceHeaderObu(const uint8_t* data, size_t size, std::vector<uint8_t>& outObu, Av1SequenceHeaderInfo& info);
+    std::vector<uint8_t> BuildAv1CFromSequenceObu(const std::vector<uint8_t>& seqObu, const Av1SequenceHeaderInfo& info);
+
     std::vector<uint8_t> BuildAacSpecificConfig(int sampleRate, int channels);
-    bool ProcessEncodedBitstream(EncoderState* state, const uint8_t* data, size_t size);
+    bool InitializeMp4Writer(EncoderState* state, int codec, const std::vector<uint8_t>& codecPrivate);
+    bool ProcessEncodedBitstream(EncoderState* state, const uint8_t* data, size_t size, NV_ENC_PIC_TYPE picType);
     bool ConsumeAsyncBitstream(EncoderState* state, size_t index);
     bool InitializeAsyncResources(EncoderState* state, uint32_t depth);
     void ReleaseAsyncResources(EncoderState* state);
@@ -405,9 +424,17 @@ namespace
         return file.Write(value, 4);
     }
 
-    bool WriteFtyp(FileWriter& file, bool hevc)
+    bool WriteFtyp(FileWriter& file, int codec)
     {
-        const char* brand = hevc ? "hvc1" : "avc1";
+        const char* brand = "avc1";
+        if (codec == kCodecHevc)
+        {
+            brand = "hvc1";
+        }
+        else if (codec == kCodecAv1)
+        {
+            brand = "av01";
+        }
         const uint32_t boxSize = 32;
         return WriteU32BE(file, boxSize)
             && WriteString4(file, "ftyp")
@@ -419,7 +446,7 @@ namespace
             && WriteString4(file, "mp41");
     }
 
-    bool InitializeMp4Writer(EncoderState* state, bool hevc, const std::vector<uint8_t>& codecPrivate)
+    bool InitializeMp4Writer(EncoderState* state, int codec, const std::vector<uint8_t>& codecPrivate)
     {
         if (state->writerInitialized)
         {
@@ -436,13 +463,13 @@ namespace
             return false;
         }
 
-        state->isHevc = hevc;
+        state->codec = codec;
         if (!codecPrivate.empty())
         {
             state->codecPrivate = codecPrivate;
         }
 
-        if (!WriteFtyp(state->file, hevc))
+        if (!WriteFtyp(state->file, codec))
         {
             SetError(state, L"Failed to write ftyp.");
             return false;
@@ -1209,7 +1236,18 @@ namespace
         size_t stsdStart = moov.BeginBox("stsd");
         moov.WriteU32(0);
         moov.WriteU32(1);
-        const char* sampleType = state->isHevc ? "hvc1" : "avc1";
+        const char* sampleType = "avc1";
+        const char* codecBox = "avcC";
+        if (IsHevc(state))
+        {
+            sampleType = "hvc1";
+            codecBox = "hvcC";
+        }
+        else if (IsAv1(state))
+        {
+            sampleType = "av01";
+            codecBox = "av1C";
+        }
         size_t sampleEntryStart = moov.BeginBox(sampleType);
         for (int i = 0; i < 6; ++i) moov.WriteU8(0);
         moov.WriteU16(1);
@@ -1229,7 +1267,7 @@ namespace
         moov.WriteU16(0x0018);
         moov.WriteU16(0xFFFF);
 
-        size_t codecBoxStart = moov.BeginBox(state->isHevc ? "hvcC" : "avcC");
+        size_t codecBoxStart = moov.BeginBox(codecBox);
         moov.WriteBytes(state->codecPrivate);
         moov.EndBox(codecBoxStart);
 
@@ -1486,6 +1524,581 @@ namespace
         return hvcc;
     }
 
+    struct Av1SequenceHeaderInfo
+    {
+        uint8_t seqProfile = 0;
+        uint8_t seqLevelIdx0 = 0;
+        uint8_t seqTier0 = 0;
+        uint8_t highBitdepth = 0;
+        uint8_t twelveBit = 0;
+        uint8_t monoChrome = 0;
+        uint8_t subsamplingX = 1;
+        uint8_t subsamplingY = 1;
+        uint8_t chromaSamplePosition = 0;
+        uint8_t initialDelayPresent = 0;
+        uint8_t initialDelayMinusOne = 0;
+    };
+
+    struct BitReader
+    {
+        const uint8_t* data = nullptr;
+        size_t size = 0;
+        size_t bitPos = 0;
+
+        bool ReadBits(uint32_t& value, uint32_t bits)
+        {
+            if (bits == 0 || bits > 32)
+            {
+                return false;
+            }
+            if (bitPos + bits > size * 8)
+            {
+                return false;
+            }
+            uint32_t v = 0;
+            for (uint32_t i = 0; i < bits; ++i)
+            {
+                size_t byteIndex = (bitPos + i) / 8;
+                size_t bitIndex = 7 - ((bitPos + i) % 8);
+                uint8_t bit = (data[byteIndex] >> bitIndex) & 0x1;
+                v = (v << 1) | bit;
+            }
+            bitPos += bits;
+            value = v;
+            return true;
+        }
+
+        bool ReadBit(uint8_t& value)
+        {
+            uint32_t v = 0;
+            if (!ReadBits(v, 1))
+            {
+                return false;
+            }
+            value = static_cast<uint8_t>(v);
+            return true;
+        }
+
+        bool ReadUvlc(uint32_t& value)
+        {
+            uint32_t leadingZero = 0;
+            uint8_t bit = 0;
+            while (true)
+            {
+                if (!ReadBit(bit))
+                {
+                    return false;
+                }
+                if (bit == 1)
+                {
+                    break;
+                }
+                leadingZero++;
+                if (leadingZero > 31)
+                {
+                    return false;
+                }
+            }
+            if (leadingZero == 0)
+            {
+                value = 0;
+                return true;
+            }
+            uint32_t suffix = 0;
+            if (!ReadBits(suffix, leadingZero))
+            {
+                return false;
+            }
+            value = ((1u << leadingZero) - 1u) + suffix;
+            return true;
+        }
+    };
+
+    bool ParseTimingInfo(BitReader& reader)
+    {
+        uint32_t ignored = 0;
+        if (!reader.ReadBits(ignored, 32)) return false;
+        if (!reader.ReadBits(ignored, 32)) return false;
+        uint8_t equalPictureInterval = 0;
+        if (!reader.ReadBit(equalPictureInterval)) return false;
+        if (equalPictureInterval)
+        {
+            if (!reader.ReadUvlc(ignored)) return false;
+        }
+        return true;
+    }
+
+    bool ParseDecoderModelInfo(BitReader& reader, uint8_t& bufferDelayLengthMinus1)
+    {
+        uint32_t temp = 0;
+        if (!reader.ReadBits(temp, 5)) return false;
+        bufferDelayLengthMinus1 = static_cast<uint8_t>(temp);
+        if (!reader.ReadBits(temp, 32)) return false;
+        if (!reader.ReadBits(temp, 5)) return false;
+        if (!reader.ReadBits(temp, 5)) return false;
+        return true;
+    }
+
+    bool ParseOperatingParametersInfo(BitReader& reader, uint8_t bufferDelayLengthMinus1)
+    {
+        uint32_t temp = 0;
+        uint32_t bits = static_cast<uint32_t>(bufferDelayLengthMinus1) + 1;
+        if (!reader.ReadBits(temp, bits)) return false;
+        if (!reader.ReadBits(temp, bits)) return false;
+        uint8_t ignored = 0;
+        if (!reader.ReadBit(ignored)) return false;
+        return true;
+    }
+
+    bool ParseColorConfig(BitReader& reader, uint8_t seqProfile, Av1SequenceHeaderInfo& info)
+    {
+        uint8_t highBitdepth = 0;
+        if (!reader.ReadBit(highBitdepth)) return false;
+        uint8_t twelveBit = 0;
+        if (seqProfile == 2 && highBitdepth)
+        {
+            if (!reader.ReadBit(twelveBit)) return false;
+        }
+        uint8_t monoChrome = 0;
+        if (seqProfile == 1)
+        {
+            monoChrome = 0;
+        }
+        else
+        {
+            if (!reader.ReadBit(monoChrome)) return false;
+        }
+
+        uint8_t colorDescriptionPresent = 0;
+        if (!reader.ReadBit(colorDescriptionPresent)) return false;
+        if (colorDescriptionPresent)
+        {
+            uint32_t ignored = 0;
+            if (!reader.ReadBits(ignored, 8)) return false;
+            if (!reader.ReadBits(ignored, 8)) return false;
+            if (!reader.ReadBits(ignored, 8)) return false;
+        }
+
+        uint8_t colorRange = 0;
+        if (!reader.ReadBit(colorRange)) return false;
+
+        uint8_t subsamplingX = 1;
+        uint8_t subsamplingY = 1;
+        uint8_t chromaSamplePosition = 0;
+        if (monoChrome)
+        {
+            subsamplingX = 1;
+            subsamplingY = 1;
+            chromaSamplePosition = 0;
+        }
+        else if (seqProfile == 0)
+        {
+            subsamplingX = 1;
+            subsamplingY = 1;
+        }
+        else if (seqProfile == 1)
+        {
+            subsamplingX = 0;
+            subsamplingY = 0;
+        }
+        else
+        {
+            if (!reader.ReadBit(subsamplingX)) return false;
+            if (subsamplingX)
+            {
+                if (!reader.ReadBit(subsamplingY)) return false;
+            }
+            else
+            {
+                subsamplingY = 0;
+            }
+        }
+
+        if (subsamplingX && subsamplingY)
+        {
+            uint32_t tmp = 0;
+            if (!reader.ReadBits(tmp, 2)) return false;
+            chromaSamplePosition = static_cast<uint8_t>(tmp);
+        }
+        else
+        {
+            chromaSamplePosition = 0;
+        }
+
+        info.highBitdepth = highBitdepth;
+        info.twelveBit = twelveBit;
+        info.monoChrome = monoChrome;
+        info.subsamplingX = subsamplingX;
+        info.subsamplingY = subsamplingY;
+        info.chromaSamplePosition = chromaSamplePosition;
+        return true;
+    }
+
+    bool ParseAv1SequenceHeader(const uint8_t* data, size_t size, Av1SequenceHeaderInfo& info)
+    {
+        BitReader reader{ data, size, 0 };
+        uint32_t seqProfile = 0;
+        if (!reader.ReadBits(seqProfile, 3)) return false;
+        info.seqProfile = static_cast<uint8_t>(seqProfile);
+
+        uint8_t stillPicture = 0;
+        if (!reader.ReadBit(stillPicture)) return false;
+        uint8_t reducedStillPictureHeader = 0;
+        if (!reader.ReadBit(reducedStillPictureHeader)) return false;
+
+        uint8_t timingInfoPresent = 0;
+        uint8_t decoderModelInfoPresent = 0;
+        uint8_t initialDisplayDelayPresent = 0;
+        uint8_t bufferDelayLengthMinus1 = 0;
+
+        uint32_t operatingPointsCntMinus1 = 0;
+        uint32_t seqLevelIdx0 = 0;
+        uint8_t seqTier0 = 0;
+        uint8_t initialDelayMinusOne0 = 0;
+
+        if (reducedStillPictureHeader)
+        {
+            if (!reader.ReadBits(seqLevelIdx0, 5)) return false;
+            seqTier0 = 0;
+            initialDisplayDelayPresent = 0;
+        }
+        else
+        {
+            if (!reader.ReadBit(timingInfoPresent)) return false;
+            if (timingInfoPresent)
+            {
+                if (!ParseTimingInfo(reader)) return false;
+            }
+            if (!reader.ReadBit(decoderModelInfoPresent)) return false;
+            if (decoderModelInfoPresent)
+            {
+                if (!ParseDecoderModelInfo(reader, bufferDelayLengthMinus1)) return false;
+            }
+            if (!reader.ReadBit(initialDisplayDelayPresent)) return false;
+
+            if (!reader.ReadBits(operatingPointsCntMinus1, 5)) return false;
+            for (uint32_t i = 0; i <= operatingPointsCntMinus1; ++i)
+            {
+                uint32_t opIdc = 0;
+                if (!reader.ReadBits(opIdc, 12)) return false;
+                uint32_t levelIdx = 0;
+                if (!reader.ReadBits(levelIdx, 5)) return false;
+                uint8_t tier = 0;
+                if (levelIdx > 7)
+                {
+                    if (!reader.ReadBit(tier)) return false;
+                }
+                if (decoderModelInfoPresent)
+                {
+                    uint8_t decoderModelPresent = 0;
+                    if (!reader.ReadBit(decoderModelPresent)) return false;
+                    if (decoderModelPresent)
+                    {
+                        if (!ParseOperatingParametersInfo(reader, bufferDelayLengthMinus1)) return false;
+                    }
+                }
+                uint8_t initialDelayPresentForOp = 0;
+                uint8_t initialDelayMinusOne = 0;
+                if (initialDisplayDelayPresent)
+                {
+                    if (!reader.ReadBit(initialDelayPresentForOp)) return false;
+                    if (initialDelayPresentForOp)
+                    {
+                        uint32_t tmp = 0;
+                        if (!reader.ReadBits(tmp, 4)) return false;
+                        initialDelayMinusOne = static_cast<uint8_t>(tmp);
+                    }
+                }
+                if (i == 0)
+                {
+                    seqLevelIdx0 = levelIdx;
+                    seqTier0 = tier;
+                    info.initialDelayPresent = initialDelayPresentForOp;
+                    info.initialDelayMinusOne = initialDelayMinusOne;
+                }
+            }
+        }
+
+        info.seqLevelIdx0 = static_cast<uint8_t>(seqLevelIdx0 & 0x1F);
+        info.seqTier0 = seqTier0;
+
+        uint32_t temp = 0;
+        if (!reader.ReadBits(temp, 4)) return false;
+        uint32_t frameWidthBitsMinus1 = temp;
+        if (!reader.ReadBits(temp, 4)) return false;
+        uint32_t frameHeightBitsMinus1 = temp;
+        if (!reader.ReadBits(temp, frameWidthBitsMinus1 + 1)) return false;
+        if (!reader.ReadBits(temp, frameHeightBitsMinus1 + 1)) return false;
+
+        uint8_t frameIdNumbersPresent = 0;
+        if (!reducedStillPictureHeader)
+        {
+            if (!reader.ReadBit(frameIdNumbersPresent)) return false;
+            if (frameIdNumbersPresent)
+            {
+                if (!reader.ReadBits(temp, 4)) return false;
+                if (!reader.ReadBits(temp, 3)) return false;
+            }
+        }
+
+        uint8_t use128x128Superblock = 0;
+        if (!reader.ReadBit(use128x128Superblock)) return false;
+        uint8_t enableFilterIntra = 0;
+        if (!reader.ReadBit(enableFilterIntra)) return false;
+        uint8_t enableIntraEdgeFilter = 0;
+        if (!reader.ReadBit(enableIntraEdgeFilter)) return false;
+
+        if (reducedStillPictureHeader)
+        {
+            // skip defaults for reduced header
+        }
+        else
+        {
+            uint8_t enableInterintraCompound = 0;
+            if (!reader.ReadBit(enableInterintraCompound)) return false;
+            uint8_t enableMaskedCompound = 0;
+            if (!reader.ReadBit(enableMaskedCompound)) return false;
+            uint8_t enableWarpedMotion = 0;
+            if (!reader.ReadBit(enableWarpedMotion)) return false;
+            uint8_t enableDualFilter = 0;
+            if (!reader.ReadBit(enableDualFilter)) return false;
+            uint8_t enableOrderHint = 0;
+            if (!reader.ReadBit(enableOrderHint)) return false;
+            if (enableOrderHint)
+            {
+                uint8_t enableJntComp = 0;
+                if (!reader.ReadBit(enableJntComp)) return false;
+                uint8_t enableRefFrameMvs = 0;
+                if (!reader.ReadBit(enableRefFrameMvs)) return false;
+            }
+            uint8_t seqChooseScreenContentTools = 0;
+            if (!reader.ReadBit(seqChooseScreenContentTools)) return false;
+            uint8_t seqForceScreenContentTools = 0;
+            if (!seqChooseScreenContentTools)
+            {
+                if (!reader.ReadBit(seqForceScreenContentTools)) return false;
+            }
+            if (seqForceScreenContentTools)
+            {
+                uint8_t seqChooseIntegerMv = 0;
+                if (!reader.ReadBit(seqChooseIntegerMv)) return false;
+                if (!seqChooseIntegerMv)
+                {
+                    uint8_t seqForceIntegerMv = 0;
+                    if (!reader.ReadBit(seqForceIntegerMv)) return false;
+                }
+            }
+            if (enableOrderHint)
+            {
+                if (!reader.ReadBits(temp, 3)) return false;
+            }
+        }
+
+        uint8_t enableSuperres = 0;
+        if (!reader.ReadBit(enableSuperres)) return false;
+        uint8_t enableCdef = 0;
+        if (!reader.ReadBit(enableCdef)) return false;
+        uint8_t enableRestoration = 0;
+        if (!reader.ReadBit(enableRestoration)) return false;
+
+        if (!ParseColorConfig(reader, info.seqProfile, info)) return false;
+
+        uint8_t filmGrainParamsPresent = 0;
+        if (!reader.ReadBit(filmGrainParamsPresent)) return false;
+
+        return true;
+    }
+
+    struct Av1ObuHeader
+    {
+        uint8_t type = 0;
+        bool hasSizeField = false;
+        bool extensionFlag = false;
+        uint8_t headerByte = 0;
+        uint8_t extensionByte = 0;
+        size_t headerSize = 0;
+        size_t sizeFieldBytes = 0;
+        size_t payloadSize = 0;
+        size_t totalSize = 0;
+        const uint8_t* payload = nullptr;
+    };
+
+    bool ReadLeb128(const uint8_t* data, size_t size, size_t& offset, uint64_t& value)
+    {
+        value = 0;
+        uint32_t shift = 0;
+        while (offset < size && shift < 56)
+        {
+            uint8_t byte = data[offset++];
+            value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+            if ((byte & 0x80) == 0)
+            {
+                return true;
+            }
+            shift += 7;
+        }
+        return false;
+    }
+
+    bool WriteLeb128(std::vector<uint8_t>& out, uint64_t value)
+    {
+        do
+        {
+            uint8_t byte = static_cast<uint8_t>(value & 0x7F);
+            value >>= 7;
+            if (value != 0)
+            {
+                byte |= 0x80;
+            }
+            out.push_back(byte);
+        } while (value != 0);
+        return true;
+    }
+
+    bool ParseAv1Obu(const uint8_t* data, size_t size, size_t offset, Av1ObuHeader& obu)
+    {
+        if (offset >= size)
+        {
+            return false;
+        }
+        uint8_t header = data[offset];
+        if (header & 0x80)
+        {
+            return false;
+        }
+        obu.headerByte = header;
+        obu.type = (header >> 3) & 0x0F;
+        obu.extensionFlag = ((header >> 2) & 0x01) != 0;
+        obu.hasSizeField = ((header >> 1) & 0x01) != 0;
+        obu.headerSize = 1 + (obu.extensionFlag ? 1 : 0);
+        size_t cursor = offset + 1;
+        if (obu.extensionFlag)
+        {
+            if (cursor >= size)
+            {
+                return false;
+            }
+            obu.extensionByte = data[cursor++];
+        }
+        if (!obu.hasSizeField)
+        {
+            return false;
+        }
+        uint64_t payloadSize = 0;
+        size_t sizeFieldStart = cursor;
+        if (!ReadLeb128(data, size, cursor, payloadSize))
+        {
+            return false;
+        }
+        obu.sizeFieldBytes = cursor - sizeFieldStart;
+        obu.payloadSize = static_cast<size_t>(payloadSize);
+        obu.totalSize = obu.headerSize + obu.sizeFieldBytes + obu.payloadSize;
+        if (offset + obu.totalSize > size)
+        {
+            return false;
+        }
+        obu.payload = data + offset + obu.headerSize + obu.sizeFieldBytes;
+        return true;
+    }
+
+    bool ExtractAv1SequenceHeaderObu(const uint8_t* data, size_t size, std::vector<uint8_t>& outObu, Av1SequenceHeaderInfo& info)
+    {
+        if (!data || size == 0)
+        {
+            return false;
+        }
+
+        uint8_t firstHeader = data[0];
+        bool firstHasSize = ((firstHeader >> 1) & 0x01) != 0;
+        bool firstExt = ((firstHeader >> 2) & 0x01) != 0;
+        if (!firstHasSize)
+        {
+            size_t headerSize = 1 + (firstExt ? 1 : 0);
+            if (size <= headerSize)
+            {
+                return false;
+            }
+            uint8_t type = (firstHeader >> 3) & 0x0F;
+            const uint8_t* payload = data + headerSize;
+            size_t payloadSize = size - headerSize;
+            if (type != 1)
+            {
+                return false;
+            }
+            if (!ParseAv1SequenceHeader(payload, payloadSize, info))
+            {
+                return false;
+            }
+
+            outObu.clear();
+            uint8_t header = static_cast<uint8_t>((firstHeader | 0x02) & 0xFE);
+            outObu.push_back(header);
+            if (firstExt)
+            {
+                outObu.push_back(data[1]);
+            }
+            WriteLeb128(outObu, payloadSize);
+            outObu.insert(outObu.end(), payload, payload + payloadSize);
+            return true;
+        }
+
+        size_t offset = 0;
+        while (offset < size)
+        {
+            Av1ObuHeader obu{};
+            if (!ParseAv1Obu(data, size, offset, obu))
+            {
+                return false;
+            }
+            if (obu.type == 1)
+            {
+                if (!ParseAv1SequenceHeader(obu.payload, obu.payloadSize, info))
+                {
+                    return false;
+                }
+                outObu.assign(data + offset, data + offset + obu.totalSize);
+                return true;
+            }
+            offset += obu.totalSize;
+        }
+        return false;
+    }
+
+    std::vector<uint8_t> BuildAv1CFromSequenceObu(const std::vector<uint8_t>& seqObu, const Av1SequenceHeaderInfo& info)
+    {
+        std::vector<uint8_t> av1c;
+        av1c.reserve(4 + seqObu.size());
+        av1c.push_back(0x80 | 0x01); // marker=1, version=1
+        av1c.push_back(static_cast<uint8_t>(((info.seqProfile & 0x07) << 5) | (info.seqLevelIdx0 & 0x1F)));
+        av1c.push_back(static_cast<uint8_t>(((info.seqTier0 & 0x01) << 7)
+            | ((info.highBitdepth & 0x01) << 6)
+            | ((info.twelveBit & 0x01) << 5)
+            | ((info.monoChrome & 0x01) << 4)
+            | ((info.subsamplingX & 0x01) << 3)
+            | ((info.subsamplingY & 0x01) << 2)
+            | (info.chromaSamplePosition & 0x03)));
+        av1c.push_back(static_cast<uint8_t>(((info.initialDelayPresent & 0x01) << 4)
+            | (info.initialDelayMinusOne & 0x0F)));
+        av1c.insert(av1c.end(), seqObu.begin(), seqObu.end());
+        return av1c;
+    }
+
+    bool BuildAv1CFromBitstream(const std::vector<uint8_t>& bitstream, std::vector<uint8_t>& out)
+    {
+        if (bitstream.empty())
+        {
+            return false;
+        }
+        std::vector<uint8_t> seqObu;
+        Av1SequenceHeaderInfo info{};
+        if (!ExtractAv1SequenceHeaderObu(bitstream.data(), bitstream.size(), seqObu, info))
+        {
+            return false;
+        }
+        out = BuildAv1CFromSequenceObu(seqObu, info);
+        return !out.empty();
+    }
+
     std::vector<uint8_t> ConvertToLengthPrefixed(const std::vector<NalUnit>& units, bool keepParameterSets)
     {
         std::vector<uint8_t> output;
@@ -1508,7 +2121,7 @@ namespace
         return output;
     }
 
-    bool ProcessEncodedBitstream(EncoderState* state, const uint8_t* data, size_t size)
+    bool ProcessEncodedBitstream(EncoderState* state, const uint8_t* data, size_t size, NV_ENC_PIC_TYPE picType)
     {
         if (!state || !data || size == 0)
         {
@@ -1516,7 +2129,48 @@ namespace
         }
 
         std::vector<uint8_t> buffer(data, data + size);
-        bool hevc = (state->initParams.encodeGUID == NV_ENC_CODEC_HEVC_GUID);
+        const bool hevc = IsHevc(state);
+        const bool av1 = IsAv1(state);
+        if (av1)
+        {
+            // AV1 uses OBU bitstream; do not parse as Annex B.
+            bool isKeyframe = picType == NV_ENC_PIC_TYPE_IDR
+                || picType == NV_ENC_PIC_TYPE_I
+                || picType == NV_ENC_PIC_TYPE_SWITCH;
+
+            if (state->codecPrivate.empty())
+            {
+                std::vector<uint8_t> codecPrivate;
+                if (BuildAv1CFromBitstream(buffer, codecPrivate))
+                {
+                    state->codecPrivate = codecPrivate;
+                }
+            }
+
+            if (!state->writerInitialized)
+            {
+                if (!InitializeMp4Writer(state, state->codec, state->codecPrivate))
+                {
+                    return false;
+                }
+            }
+
+            if (!state->writerStarted)
+            {
+                StartWriterThread(state);
+            }
+            if (state->writerError)
+            {
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->writerMutex);
+                state->sampleQueue.push_back({ std::move(buffer), isKeyframe, false, 0 });
+            }
+            state->writerCv.notify_one();
+            return true;
+        }
+
         auto units = ParseAnnexB(buffer.data(), buffer.size(), hevc);
 
         std::vector<uint8_t> sps;
@@ -1568,7 +2222,7 @@ namespace
             {
                 return true;
             }
-            if (!InitializeMp4Writer(state, hevc, codecPrivate))
+            if (!InitializeMp4Writer(state, state->codec, codecPrivate))
             {
                 return false;
             }
@@ -1643,9 +2297,14 @@ namespace
             if (status == NV_ENC_SUCCESS)
             {
                 LogLine(state, L"async bitstream lock ok slot=" + std::to_wstring(index));
-                bool ok = ProcessEncodedBitstream(state,
-                    static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
-                    lockBitstream.bitstreamSizeInBytes);
+                bool ok = true;
+                if (lockBitstream.bitstreamSizeInBytes > 0)
+                {
+                    ok = ProcessEncodedBitstream(state,
+                        static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
+                        lockBitstream.bitstreamSizeInBytes,
+                        lockBitstream.pictureType);
+                }
 
                 auto unlockStatus = state->funcs.nvEncUnlockBitstream(state->session, state->asyncBitstreams[index]);
                 if (!CheckStatus(state, unlockStatus, L"nvEncUnlockBitstream failed"))
@@ -1782,6 +2441,49 @@ namespace
         return true;
     }
 
+    bool TryInitAv1CodecPrivate(EncoderState* state)
+    {
+        if (!state || !IsAv1(state) || !state->codecPrivate.empty() || !state->funcs.nvEncGetSequenceParams)
+        {
+            return true;
+        }
+
+        std::vector<uint8_t> buffer(NV_MAX_SEQ_HDR_LEN);
+        uint32_t outSize = 0;
+        NV_ENC_SEQUENCE_PARAM_PAYLOAD payload{};
+        payload.version = NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
+        payload.inBufferSize = static_cast<uint32_t>(buffer.size());
+        payload.spsId = 0;
+        payload.ppsId = 0;
+        payload.spsppsBuffer = buffer.data();
+        payload.outSPSPPSPayloadSize = &outSize;
+
+        auto status = state->funcs.nvEncGetSequenceParams(state->session, &payload);
+        if (status != NV_ENC_SUCCESS)
+        {
+            LogLine(state, L"nvEncGetSequenceParams failed for AV1");
+            return true;
+        }
+        if (outSize == 0 || outSize > buffer.size())
+        {
+            return true;
+        }
+
+        std::vector<uint8_t> seqObu;
+        Av1SequenceHeaderInfo info{};
+        if (!ExtractAv1SequenceHeaderObu(buffer.data(), outSize, seqObu, info))
+        {
+            return true;
+        }
+
+        auto av1c = BuildAv1CFromSequenceObu(seqObu, info);
+        if (!av1c.empty())
+        {
+            state->codecPrivate = std::move(av1c);
+        }
+        return true;
+    }
+
 
     bool InitializeEncoder(EncoderState* state, ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality, int fastPreset, int rateControlMode, int maxBitrateKbps, NV_ENC_BUFFER_FORMAT bufferFormat, int hevcAsync)
     {
@@ -1791,13 +2493,14 @@ namespace
         state->fastPreset = fastPreset;
         state->originalBufferFormat = bufferFormat;
         state->bufferFormat = bufferFormat;
+        state->codec = codec;
         state->device = device;
         if (state->device)
         {
             state->device->AddRef();
         }
 
-        const bool hevcAsyncOptIn = (codec == 1 && hevcAsync != 0);
+        const bool hevcAsyncOptIn = (codec == kCodecHevc && hevcAsync != 0);
 
         if (state->fastPreset != 0)
         {
@@ -1850,7 +2553,15 @@ namespace
         state->initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
         state->config.version = NV_ENC_CONFIG_VER;
 
-        const GUID encodeGuid = (codec == 1) ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+        GUID encodeGuid = NV_ENC_CODEC_H264_GUID;
+        if (codec == kCodecHevc)
+        {
+            encodeGuid = NV_ENC_CODEC_HEVC_GUID;
+        }
+        else if (codec == kCodecAv1)
+        {
+            encodeGuid = NV_ENC_CODEC_AV1_GUID;
+        }
         const GUID presetGuid = (state->fastPreset != 0)
             ? NV_ENC_PRESET_P1_GUID
             : (quality <= 0 ? NV_ENC_PRESET_P1_GUID : (quality == 2 ? NV_ENC_PRESET_P7_GUID : NV_ENC_PRESET_P3_GUID));
@@ -1883,7 +2594,7 @@ namespace
         state->initParams.enablePTD = 1;
         state->initParams.reportSliceOffsets = 0;
         state->initParams.enableSubFrameWrite = 0;
-        const bool allowAsync = (codec == 0) || (codec == 1 && hevcAsyncOptIn);
+        const bool allowAsync = (codec == kCodecH264) || (codec == kCodecAv1) || (codec == kCodecHevc && hevcAsyncOptIn);
         state->initParams.enableEncodeAsync = allowAsync ? 1 : 0;
         state->initParams.encodeConfig = &state->config;
 
@@ -1907,10 +2618,28 @@ namespace
             state->config.rcParams.lookaheadDepth = 0;
         }
 
-        if (codec == 1)
+        if (codec == kCodecHevc)
         {
             state->config.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
             state->config.encodeCodecConfig.hevcConfig.idrPeriod = state->config.gopLength;
+        }
+        else if (codec == kCodecAv1)
+        {
+            state->config.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
+            state->config.encodeCodecConfig.av1Config.outputAnnexBFormat = 0;
+            state->config.encodeCodecConfig.av1Config.idrPeriod = state->config.gopLength;
+            if (state->config.encodeCodecConfig.av1Config.chromaFormatIDC == 0)
+            {
+                state->config.encodeCodecConfig.av1Config.chromaFormatIDC = 1;
+            }
+            if (state->config.encodeCodecConfig.av1Config.outputBitDepth == 0)
+            {
+                state->config.encodeCodecConfig.av1Config.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+            }
+            if (state->config.encodeCodecConfig.av1Config.inputBitDepth == 0)
+            {
+                state->config.encodeCodecConfig.av1Config.inputBitDepth = NV_ENC_BIT_DEPTH_8;
+            }
         }
         else
         {
@@ -1924,11 +2653,16 @@ namespace
             return false;
         }
 
+        if (!TryInitAv1CodecPrivate(state))
+        {
+            return false;
+        }
+
         if (!allowAsync)
         {
             state->initParams.enableEncodeAsync = 0;
             state->asyncEnabled = false;
-            if (codec == 1)
+            if (codec == kCodecHevc)
             {
                 LogLine(state, L"HEVC async disabled (sync mode)");
             }
@@ -1957,10 +2691,10 @@ namespace
             {
                 state->initParams.enableEncodeAsync = 0;
                 state->asyncEnabled = false;
-                if (codec == 1)
-                {
-                    LogLine(state, L"HEVC async failed, fallback to sync");
-                }
+            if (codec == kCodecHevc)
+            {
+                LogLine(state, L"HEVC async failed, fallback to sync");
+            }
                 NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream{};
                 createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
                 status = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createBitstream);
@@ -2100,7 +2834,8 @@ namespace
 
         bool ok = ProcessEncodedBitstream(state,
             static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
-            lockBitstream.bitstreamSizeInBytes);
+            lockBitstream.bitstreamSizeInBytes,
+            lockBitstream.pictureType);
 
         status = state->funcs.nvEncUnlockBitstream(state->session, state->bitstream);
         if (!CheckStatus(state, status, L"nvEncUnlockBitstream failed"))
@@ -2402,7 +3137,7 @@ void* NvencCreate(ID3D11Device* device, int width, int height, int fps, int bitr
     }
 
     std::vector<uint8_t> empty;
-    if (!InitializeMp4Writer(state, codec == 1, empty))
+    if (!InitializeMp4Writer(state, codec, empty))
     {
         return state;
     }
@@ -2484,18 +3219,20 @@ int NvencFinalize(void* handle)
     pic.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
     if (state->asyncEnabled)
     {
-        if (!state->bitstream)
+        if (state->asyncBitstreams.empty())
         {
-            NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream{};
-            createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-            auto status = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createBitstream);
-            if (!CheckStatus(state, status, L"nvEncCreateBitstreamBuffer failed"))
-            {
-                return 0;
-            }
-            state->bitstream = createBitstream.bitstreamBuffer;
+            SetError(state, L"NVENC async resources are unavailable.");
+            return 0;
         }
-        pic.outputBitstream = state->bitstream;
+
+        const size_t asyncSlot = state->asyncIndex % state->asyncBitstreams.size();
+        if (state->asyncPending[asyncSlot] && !ConsumeAsyncBitstream(state, asyncSlot))
+        {
+            return 0;
+        }
+
+        pic.outputBitstream = state->asyncBitstreams[asyncSlot];
+        pic.completionEvent = state->asyncEvents[asyncSlot];
         auto status = state->funcs.nvEncEncodePicture(state->session, &pic);
         if (status != NV_ENC_SUCCESS)
         {
@@ -2503,30 +3240,9 @@ int NvencFinalize(void* handle)
             return 0;
         }
 
-        NV_ENC_LOCK_BITSTREAM lockBitstream{};
-        lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lockBitstream.outputBitstream = state->bitstream;
-        status = state->funcs.nvEncLockBitstream(state->session, &lockBitstream);
-        if (!CheckStatus(state, status, L"nvEncLockBitstream failed"))
-        {
-            return 0;
-        }
-
-        bool ok = ProcessEncodedBitstream(state,
-            static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
-            lockBitstream.bitstreamSizeInBytes);
-
-        status = state->funcs.nvEncUnlockBitstream(state->session, state->bitstream);
-        if (!CheckStatus(state, status, L"nvEncUnlockBitstream failed"))
-        {
-            return 0;
-        }
-        if (!ok)
-        {
-            return 0;
-        }
-
-        LogLine(state, L"encode EOS submitted (sync)");
+        state->asyncPending[asyncSlot] = true;
+        state->asyncIndex = (asyncSlot + 1) % state->asyncBitstreams.size();
+        LogLine(state, L"encode EOS submitted (async)");
         if (!DrainAsyncBitstreams(state))
         {
             return 0;
@@ -2561,6 +3277,12 @@ void NvencDestroy(void* handle)
     }
 
     LogLine(state, L"destroy");
+    if (!state->mp4Finalized)
+    {
+        DrainAsyncBitstreams(state);
+        FinalizeMp4(state);
+    }
+
     if (state->session)
     {
         ReleaseAsyncResources(state);
@@ -2581,12 +3303,6 @@ void NvencDestroy(void* handle)
         }
         state->funcs.nvEncDestroyEncoder(state->session);
         state->session = nullptr;
-    }
-
-    if (!state->mp4Finalized)
-    {
-        DrainAsyncBitstreams(state);
-        FinalizeMp4(state);
     }
 
     if (state->aacEncoder)
