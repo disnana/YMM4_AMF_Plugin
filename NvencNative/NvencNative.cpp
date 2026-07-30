@@ -11,6 +11,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <atomic>
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -211,7 +212,7 @@ namespace
         std::thread writerThread;
         bool writerStarted = false;
         bool writerStop = false;
-        bool writerError = false;
+        std::atomic_bool writerError = false;
         struct EncodedSample
         {
             std::vector<uint8_t> data;
@@ -1367,6 +1368,14 @@ namespace
             return false;
         }
         StopWriterThread(state);
+        if (state->writerError)
+        {
+            if (state->lastError.empty())
+            {
+                SetError(state, L"Writer thread error.");
+            }
+            return false;
+        }
 
         if (state->codecPrivate.empty())
         {

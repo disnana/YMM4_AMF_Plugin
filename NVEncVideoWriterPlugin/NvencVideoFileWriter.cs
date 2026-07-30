@@ -13,6 +13,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
     private readonly string _outputPath;
     private readonly VideoInfo _videoInfo;
     private readonly NvencSettings _settings;
+    private readonly int _audioChannels;
     private IntPtr _encoderHandle = IntPtr.Zero;
     private bool _disposed;
     private readonly object _encodeLock = new();
@@ -22,6 +23,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
         _outputPath = outputPath;
         _videoInfo = videoInfo;
         _settings = settings;
+        _audioChannels = ResolveAudioChannels(videoInfo);
     }
 
     public VideoFileWriterSupportedStreams SupportedStreams => VideoFileWriterSupportedStreams.Audio | VideoFileWriterSupportedStreams.Video;
@@ -113,7 +115,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
 
     private void InitializeEncoder(ID3D11Texture2D texture)
     {
-        var device = texture.Device;
+        using var device = texture.Device;
         if (device is null)
         {
             throw new InvalidOperationException("D3D11 デバイスを取得できませんでした。");
@@ -183,8 +185,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
     private void WriteAudioInternal(float[] samples)
     {
         var sampleRate = Math.Max(8000, _videoInfo.Hz);
-        var channels = ResolveAudioChannels();
-        var result = NvencNativeMethods.NvencWriteAudio(_encoderHandle, samples, samples.Length, sampleRate, channels);
+        var result = NvencNativeMethods.NvencWriteAudio(_encoderHandle, samples, samples.Length, sampleRate, _audioChannels);
         if (result == 0)
         {
             throw new InvalidOperationException(GetNativeError());
@@ -214,15 +215,15 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
         };
     }
 
-    private int ResolveAudioChannels()
+    private static int ResolveAudioChannels(VideoInfo videoInfo)
     {
         const int fallback = 2;
-        var type = _videoInfo.GetType();
+        var type = videoInfo.GetType();
         var prop = type.GetProperty("Channels")
             ?? type.GetProperty("ChannelCount")
             ?? type.GetProperty("AudioChannels")
             ?? type.GetProperty("AudioChannelCount");
-        if (prop?.GetValue(_videoInfo) is int value && value > 0)
+        if (prop?.GetValue(videoInfo) is int value && value > 0)
         {
             return value;
         }

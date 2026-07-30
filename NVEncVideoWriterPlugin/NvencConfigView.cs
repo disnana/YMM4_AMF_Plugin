@@ -62,8 +62,6 @@ internal sealed class NvencConfigView : UserControl
             _hevcAsyncCheckBox.IsEnabled = _settings.Codec == NvencCodec.H265;
             if (_settings.Codec != NvencCodec.H265)
             {
-                _settings.HevcAsync = false;
-                _hevcAsyncCheckBox.IsChecked = false;
                 return;
             }
 
@@ -144,7 +142,6 @@ internal sealed class NvencConfigView : UserControl
             }
 
             _bitrateTextBox.IsEnabled = true;
-            _settings.BitrateKbps = 12000;
             _bitrateTextBox.Text = _settings.BitrateKbps.ToString();
         };
         _bitrateTextBox.TextChanged += (_, _) =>
