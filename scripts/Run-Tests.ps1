@@ -45,3 +45,7 @@ if ($Suite -in @('GpuSmoke', 'All')) {
         }
     }
 }
+
+# Expected negative CLI checks leave LASTEXITCODE non-zero even when every
+# assertion above passed. Normalize it so CI observes the script result.
+$global:LASTEXITCODE = 0

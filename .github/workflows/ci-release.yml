@@ -66,7 +66,7 @@ jobs:
             artifacts/release/*.sha256
           if-no-files-found: error
 
-      - name: Decide whether VERSION requests a release
+      - name: Decide whether VERSION is ahead of published releases
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         id: version
         shell: pwsh
@@ -79,44 +79,32 @@ jobs:
               throw "VERSION is not valid SemVer: $current"
           }
 
-          $before = '${{ github.event.before }}'
-          $allZero = $before -match '^0+$'
-          $changed = $allZero
-          if (-not $allZero) {
-              & git diff --quiet $before $env:GITHUB_SHA -- VERSION
-              if ($LASTEXITCODE -eq 1) {
-                  $changed = $true
-              }
-              elseif ($LASTEXITCODE -ne 0) {
-                  throw 'Unable to determine whether VERSION changed.'
-              }
-          }
-
-          if (-not $changed) {
+          $currentTag = "v$current"
+          $tagNames = @(& git tag --list 'v*')
+          if ($currentTag -in $tagNames) {
               'release=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
               "version=$current" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
               exit 0
           }
 
-          if (-not $allZero) {
-              $previousText = & git show "${before}:VERSION" 2>$null
-              if ($LASTEXITCODE -eq 0) {
-                  $previous = ($previousText -join "`n").Trim()
+          $published = @(
+              foreach ($tagName in $tagNames) {
+                  $tagVersionText = $tagName.Substring(1)
                   try {
-                      $previousSemVer = [semver]$previous
+                      [PSCustomObject]@{
+                          Tag = $tagName
+                          Version = [semver]$tagVersionText
+                      }
                   }
                   catch {
-                      throw "The previous VERSION is not valid SemVer: $previous"
-                  }
-                  if ($currentSemVer -le $previousSemVer) {
-                      throw "VERSION must increase: $previous -> $current"
+                      Write-Warning "Ignoring non-SemVer tag: $tagName"
                   }
               }
-          }
+          )
 
-          $existingTag = & git tag --list "v$current"
-          if ($existingTag) {
-              throw "Tag v$current already exists. Increment VERSION before releasing again."
+          $latest = $published | Sort-Object Version -Descending | Select-Object -First 1
+          if ($null -ne $latest -and $currentSemVer -le $latest.Version) {
+              throw "VERSION must be greater than the latest release: $($latest.Version) -> $current"
           }
 
           'release=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append

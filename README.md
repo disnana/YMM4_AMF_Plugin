@@ -98,7 +98,7 @@ YMM4公式サンプルの配布方式に合わせ、プラグイン用サブフ�
 - `YMM4-Radeon-AMF-v<version>.ymme`
 - `YMM4-Radeon-AMF-v<version>.ymme.sha256`
 
-GitHub Actionsはpushとpull requestのたびに、公式配布元のYMM4 Liteをビルド参照として一時取得し、ネイティブDLL、管理DLL、`.ymme`の生成を検証します。`master`へのpushで`VERSION`が以前より大きいSemVerへ更新されていた場合に限り、`v<version>`タグとGitHub Releaseを自動作成して`.ymme`とSHA-256を添付します。`VERSION`が未変更ならReleaseは作らず、同値・巻き戻し・既存タグとの衝突はエラーにします。
+GitHub Actionsはpushとpull requestのたびに、公式配布元のYMM4 Liteをビルド参照として一時取得し、ネイティブDLL、管理DLL、`.ymme`の生成を検証します。`master`へのpush時に`VERSION`が最新の公開済みSemVerタグより大きい場合、`v<version>`タグとGitHub Releaseを自動作成して`.ymme`とSHA-256を添付します。現在の`VERSION`と同じタグが既にあればReleaseは作らず、巻き戻しはエラーにします。
 
 ## YMM4プラグインのビルドと配置
 
