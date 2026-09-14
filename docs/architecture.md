@@ -1,4 +1,4 @@
-# AMF版アーキテクチャ（0.1.0）
+# AMF版アーキテクチャ（0.1.1）
 
 ## データ経路
 
@@ -37,12 +37,12 @@ ImmediateContextを使う`CopyResource`はYMM4の`WriteVideo`呼び出しthread�
 
 ## 現在の計測境界
 
-`RadeonBench`のwall timeは最初のfixture生成・uploadからMP4 closeまでを含む。出力JSONの`completed_fps`はaccepted frame数と正常Drainを前提にするが、decode検証は別プロセスで行う。YMM4描画時間、品質比較、P2経路との競合比較は含まれない。
+`RadeonBench`のwall timeは最初のfixture生成・uploadからMP4 closeまでを含む。出力JSONの`completed_fps`はaccepted frame数と正常Drainを前提にするが、decode検証は別プロセスで行う。YMM4描画時間と他アプリとのGPU競合は含まれない。
 
-## 検証状況と次の実装順
+## 検証状況と今後の調査候補
 
 1. YMM4配置を指定したmanaged buildとH.264の短い実プロジェクトE2Eは完了。HEVCのYMM4 E2Eは未検証。
-2. 次はP2（VideoProcessor -> owned NV12 pool）を実装し、P1と同条件比較する。
-3. ffprobe / full decode、frame marker順序、色メタデータ、音声duration差をrun JSONへ取り込むvalidatorは実装済み。
-4. 色差、VMAF、音声marker相互相関は未実装。
-5. 1080p 60秒と4K 10秒の単発検証、release packagingは完了。長時間反復、キャンセル、device removalは未検証。
+2. ffprobe / full decode、frame marker順序、色メタデータ、音声duration差をrun JSONへ取り込むvalidatorは実装済み。
+3. VideoProcessor経路はRX 6800 XTのYMM4実測で既存経路より約7%低速だったため、実装と設定UIから廃止した。比較値はベンチ記録にのみ残す。
+4. 性能調査を再開する場合は、YMM4からのフレーム到着、slot待機、AMF submit/outputの区間計測を候補とする。現在の計測だけではAMFのハードウェア上限や処理時間の内訳は判定できない。0.1.1では追加の処理変更を行わない。
+5. 色差、VMAF、音声marker相互相関、HEVCのYMM4 E2E、長時間反復、キャンセル、device removalは未検証。

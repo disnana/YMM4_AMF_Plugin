@@ -48,4 +48,15 @@
     <None Include="..\LICENSE" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\AmfNative\bin\$(Configuration)\AmfNative.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\\AmfNative\\bin\\$(Configuration)\\AmfNative.dll')" />
   </ItemGroup>
+
+  <Target Name="StagePluginArtifacts" AfterTargets="Build">
+    <PropertyGroup>
+      <ArtifactBinDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\artifacts\bin\'))</ArtifactBinDir>
+      <AmfNativePath>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\AmfNative\bin\$(Configuration)\AmfNative.dll'))</AmfNativePath>
+    </PropertyGroup>
+    <MakeDir Directories="$(ArtifactBinDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ArtifactBinDir)" />
+    <Copy SourceFiles="$(AmfNativePath)" DestinationFolder="$(ArtifactBinDir)" Condition="Exists('$(AmfNativePath)')" />
+    <Message Importance="High" Text="Plugin artifacts staged to $(ArtifactBinDir)" />
+  </Target>
 </Project>

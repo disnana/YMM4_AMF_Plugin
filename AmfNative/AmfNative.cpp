@@ -1398,7 +1398,14 @@ namespace
 
         if (state->codecPrivate.empty())
         {
-            SetError(state, L"Video codec header not found.");
+            if (state->lastError.empty())
+            {
+                SetError(state, L"Video codec header not found.");
+            }
+            else
+            {
+                LogLine(state, L"[error] Video codec header not found (secondary error; preserving the earlier failure).");
+            }
             return false;
         }
 
@@ -3340,6 +3347,7 @@ namespace
 
         LogLine(state, L"AMF runtime version=" + std::to_wstring(state->runtimeVersion));
         LogLine(state, L"owned texture pool=" + std::to_wstring(texturePoolSize));
+        LogLine(state, L"input path=copy_bgra_efc");
         StartOutputThread(state);
         return true;
     }

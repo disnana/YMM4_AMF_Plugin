@@ -38,7 +38,6 @@ if ($IncludePlugin) {
     $normalizedYmm4 = [System.IO.Path]::GetFullPath($Ymm4Directory) + [System.IO.Path]::DirectorySeparatorChar
     & dotnet build (Join-Path $repositoryRoot 'AMFVideoWriterPlugin\AMFVideoWriterPlugin.csproj') -c $Configuration -p:Platform=x64 "-p:YMM4DirPath=$normalizedYmm4"
     if ($LASTEXITCODE -ne 0) { throw "Managed plugin build failed with exit code $LASTEXITCODE." }
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot "AMFVideoWriterPlugin\bin\x64\$Configuration\net10.0-windows10.0.19041.0\AMFPlugin.dll") -Destination $artifactBin -Force
 }
 
 Write-Host "Build artifacts: $artifactBin"

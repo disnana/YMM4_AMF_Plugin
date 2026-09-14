@@ -11,7 +11,7 @@ YukkuriMovieMaker 4（YMM4）のD3D11描画結果を、AMD Advanced Media Framew
 ## 実装済み
 
 - YMM4の`ID2D1Bitmap1`から`ID3D11Texture2D`を取得する`IVideoFileWriter2`接続
-- 借用テクスチャを保持せず、4 / 6 / 8枚の所有BGRA/RGBAテクスチャへ`CopyResource`する安全なP1経路
+- 借用テクスチャを保持せず、4 / 6 / 8枚の所有BGRA/RGBAテクスチャへ`CopyResource`する安全な入力経路
 - 同じD3D11 deviceを使うAMF H.264 / HEVC encoder（AMF EFCによるRGB入力変換）
 - `SubmitInput`と専用`QueryOutput`スレッドによる非同期処理
 - 入力surfaceのスロットIDが出力へ戻ったことを確認してから再利用する所有権管理
@@ -22,8 +22,6 @@ YukkuriMovieMaker 4（YMM4）のD3D11描画結果を、AMD Advanced Media Framew
 
 ## 未実装・未検証
 
-- D3D11 VideoProcessorで所有NV12へ変換するP2経路
-- P1/P2の比較によるAuto選択
 - 色差、VMAF、音声marker相互相関（frame marker順序照合は実装済み）
 - BT.709 / limited rangeの画素値検証（container metadataの自動検証は実装済み）
 - YMM4実プロジェクトでのL3比較と、標準出力に対する高速化率
@@ -108,6 +106,8 @@ YMM4の配置を明示してビルドします。
 .\scripts\Build.ps1 -Configuration Release -IncludePlugin -Ymm4Directory 'C:\path\to\YukkuriMovieMaker_v4'
 ```
 
+管理プラグインのビルドが成功すると、`AMFPlugin.dll`と同じ構成の`AmfNative.dll`はMSBuildの後処理で`artifacts/bin/`へ自動配置されます。手動コピーは不要です。
+
 YMM4へ配置する操作は別スクリプトです。対象を確認するには最初に`-WhatIf`を利用できます。
 
 ```powershell
@@ -136,8 +136,9 @@ AMD Radeon RX 6800 XTで次を確認しました。
 - HEVC、640x360、60fps、120フレーム: MP4 close成功、ffprobeで120フレーム、ffmpeg全decodeエラーなし
 - YMM4で「Radeon (AMF) プラグイン出力」を認識し、H.264 MP4の実書き出しと再生に成功
 - H.264、1920x1080、60fps、900フレーム、各5回: pool 4 / 6 / 8の全15出力で全decode、frame marker順序、BT.709 / limited metadata検証に成功。中央値は248.9 / 277.1 / 276.0fps
+- 実験したVideoProcessor経路は、同じ7,259フレームのYMM4実出力で既存経路より約7%低速だったため廃止
 
-pool 6はpool 4よりstandalone中央値が約11.3%高く、pool 8と同等だったため、新規設定の既定値を6としています。詳細は[実測記録](docs/benchmarks/2026-09-14-rx6800xt.md)を参照してください。これはstandaloneスモークと基本的なYMM4 E2Eです。画質同等性、長時間安定性、標準出力に対する速度優位を証明する結果ではありません。
+pool 6はpool 4よりstandalone中央値が約11.3%高く、pool 8と同等だったため、新規設定の既定値を6としています。詳細は[実測記録](docs/benchmarks/2026-09-14-rx6800xt.md)を参照してください。これはstandaloneスモークと基本的なYMM4 E2Eです。画質同等性、YMM4実負荷での安定性、標準出力に対する速度優位を証明する結果ではありません。
 
 ## ライセンスと由来
 
