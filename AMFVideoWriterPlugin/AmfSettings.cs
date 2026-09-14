@@ -6,7 +6,7 @@ internal sealed class AmfSettings
     public int BitrateKbps { get; set; } = 12000;
     public AmfQuality Quality { get; set; } = AmfQuality.Balanced;
     public AmfRateControl RateControl { get; set; } = AmfRateControl.YouTubeRecommended;
-    public int TexturePoolSize { get; set; } = 4;
+    public int TexturePoolSize { get; set; } = 6;
     public bool EnableDebugLog { get; set; }
 }
 

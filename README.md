@@ -24,8 +24,8 @@ YukkuriMovieMaker 4（YMM4）のD3D11描画結果を、AMD Advanced Media Framew
 
 - D3D11 VideoProcessorで所有NV12へ変換するP2経路
 - P1/P2の比較によるAuto選択
-- 画像内frame markerのdecode後自動照合、色差、VMAF、音声marker相互相関
-- BT.709 / limited rangeの明示設定とcontainer metadataの自動検証
+- 色差、VMAF、音声marker相互相関（frame marker順序照合は実装済み）
+- BT.709 / limited rangeの画素値検証（container metadataの自動検証は実装済み）
 - YMM4実プロジェクトでのL3比較と、標準出力に対する高速化率
 - キャンセルAPI、device removalの実機試験、長時間反復・VRAM plateau試験
 - コード署名、複数GPU・複数ドライバーでの互換性試験
@@ -73,7 +73,7 @@ git submodule update --init --recursive
 .\scripts\Run-Tests.ps1 -Suite GpuSmoke
 ```
 
-`GpuSmoke`はH.264 / HEVCを各120フレーム、AAC音声付きで作成します。ffmpeg / ffprobeがPATHにある場合は、映像フレーム数と全decodeも検証します。GPUや外部ツールがない状態を成功へ読み替えません。
+`GpuSmoke`はffmpeg / ffprobeを必須とし、H.264 / HEVCを各120フレーム、AAC音声付きで作成します。映像フレーム数、全decode、画像内16-bit frame markerの順序、BT.709 / limited rangeメタデータ、音声形式と映像・音声duration差（50ms以内）を検証します。GPUや外部ツールがない状態を成功へ読み替えません。音声marker相互相関と色差測定はまだ行いません。
 
 固定configの反復ベンチ:
 
@@ -135,8 +135,9 @@ AMD Radeon RX 6800 XTで次を確認しました。
 - H.264 + AAC stereo 48kHz: 映像120フレーム、AAC stream、ffmpeg全decodeエラーなし
 - HEVC、640x360、60fps、120フレーム: MP4 close成功、ffprobeで120フレーム、ffmpeg全decodeエラーなし
 - YMM4で「Radeon (AMF) プラグイン出力」を認識し、H.264 MP4の実書き出しと再生に成功
+- H.264、1920x1080、60fps、900フレーム、各5回: pool 4 / 6 / 8の全15出力で全decode、frame marker順序、BT.709 / limited metadata検証に成功。中央値は248.9 / 277.1 / 276.0fps
 
-これは短いstandaloneスモークと基本的なYMM4 E2Eです。画質同等性、長時間安定性、標準出力に対する速度優位を証明する結果ではありません。
+pool 6はpool 4よりstandalone中央値が約11.3%高く、pool 8と同等だったため、新規設定の既定値を6としています。詳細は[実測記録](docs/benchmarks/2026-09-14-rx6800xt.md)を参照してください。これはstandaloneスモークと基本的なYMM4 E2Eです。画質同等性、長時間安定性、標準出力に対する速度優位を証明する結果ではありません。
 
 ## ライセンスと由来
 
