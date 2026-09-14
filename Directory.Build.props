@@ -1,5 +1,11 @@
 <Project>
   <PropertyGroup>
     <YMM4DirPath>$(MSBuildThisFileDirectory)YukkuriMovieMaker_v4_Lite\</YMM4DirPath>
+    <VersionFile>$(MSBuildThisFileDirectory)VERSION</VersionFile>
+    <Version Condition="Exists('$(VersionFile)')">$([System.IO.File]::ReadAllText('$(VersionFile)').Trim())</Version>
+    <Authors>tp-li-dev</Authors>
+    <Company>Disnana</Company>
+    <RepositoryUrl>https://github.com/disnana/YMM4_AMF_Plugin</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 </Project>

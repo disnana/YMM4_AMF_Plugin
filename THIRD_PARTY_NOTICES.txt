@@ -2,7 +2,7 @@ Third-Party Notices
 ===================
 
 This project uses or depends on the following third-party components.
-These components are NOT redistributed within this repository.
+Redistribution status differs by component as noted below.
 
 1) NVIDIA NVENC SDK
    - Usage: NVENC API headers are required to build the native encoder module.
@@ -11,3 +11,16 @@ These components are NOT redistributed within this repository.
 2) YukkuriMovieMaker v4 (YMM4)
    - Usage: This is a plugin for YMM4 and references YMM4 assemblies at build/runtime.
    - Distribution: Not included. Use and distribution must comply with YMM4's terms.
+
+3) AMD Advanced Media Framework (AMF) SDK
+   - Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF
+   - Version: v1.5.2, commit eadd00804d5f7e5cd8c85d540073198312870776
+   - Usage: Public headers are used to build AmfNative.dll. The SDK repository is pinned as a Git submodule.
+   - Runtime: amfrt64.dll is provided by the installed AMD Radeon software and is not redistributed here.
+   - License: MIT. See third_party/AMF/LICENSE.txt after initializing submodules.
+   - Standards notice: The AMF license does not grant patent or other rights for H.264, HEVC, AAC, or other media standards.
+
+4) YMM4_NVEncPlugin
+   - Source: https://github.com/tarutaru247/YMM4_NVEncPlugin
+   - Reference commit: c7cf16114be09faec877e74e12df36715e1d5881
+   - Usage: The YMM4 writer integration, Media Foundation AAC path, and MP4 writer were derived from the upstream MIT-licensed implementation.

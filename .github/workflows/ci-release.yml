@@ -1,0 +1,142 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-package:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source and AMF SDK
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download official YMM4 Lite build references
+        id: ymm4
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'YukkuriMovieMaker_v4_Lite.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'YukkuriMovieMaker_v4_Lite'
+          $url = 'https://object-storage.tyo1.conoha.io/v1/nc_4fac3ef0e6d843249e0ab2f1fc3e8f85/public/YukkuriMovieMaker_v4_Lite.zip'
+
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          $pluginAssembly = Get-ChildItem -LiteralPath $extract -Filter 'YukkuriMovieMaker.Plugin.dll' -File -Recurse | Select-Object -First 1
+          if ($null -eq $pluginAssembly) {
+              throw 'YukkuriMovieMaker.Plugin.dll was not found in the official YMM4 Lite archive.'
+          }
+
+          "directory=$($pluginAssembly.Directory.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build and validate CPU-side contracts
+        shell: pwsh
+        run: ./scripts/Run-Tests.ps1 -Suite Unit
+
+      - name: Build distributable package
+        shell: pwsh
+        run: ./scripts/Package-Plugin.ps1 -Configuration Release -Ymm4Directory '${{ steps.ymm4.outputs.directory }}'
+
+      - name: Upload CI package
+        uses: actions/upload-artifact@v4
+        with:
+          name: YMM4-Radeon-AMF
+          path: |
+            artifacts/release/*.ymme
+            artifacts/release/*.sha256
+          if-no-files-found: error
+
+      - name: Decide whether VERSION requests a release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        id: version
+        shell: pwsh
+        run: |
+          $current = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          try {
+              $currentSemVer = [semver]$current
+          }
+          catch {
+              throw "VERSION is not valid SemVer: $current"
+          }
+
+          $before = '${{ github.event.before }}'
+          $allZero = $before -match '^0+$'
+          $changed = $allZero
+          if (-not $allZero) {
+              & git diff --quiet $before $env:GITHUB_SHA -- VERSION
+              if ($LASTEXITCODE -eq 1) {
+                  $changed = $true
+              }
+              elseif ($LASTEXITCODE -ne 0) {
+                  throw 'Unable to determine whether VERSION changed.'
+              }
+          }
+
+          if (-not $changed) {
+              'release=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              "version=$current" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              exit 0
+          }
+
+          if (-not $allZero) {
+              $previousText = & git show "${before}:VERSION" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                  $previous = ($previousText -join "`n").Trim()
+                  try {
+                      $previousSemVer = [semver]$previous
+                  }
+                  catch {
+                      throw "The previous VERSION is not valid SemVer: $previous"
+                  }
+                  if ($currentSemVer -le $previousSemVer) {
+                      throw "VERSION must increase: $previous -> $current"
+                  }
+              }
+          }
+
+          $existingTag = & git tag --list "v$current"
+          if ($existingTag) {
+              throw "Tag v$current already exists. Increment VERSION before releasing again."
+          }
+
+          'release=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$current" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $package = Get-ChildItem -LiteralPath artifacts/release -Filter '*.ymme' -File | Select-Object -First 1
+          if ($null -eq $package) {
+              throw 'Release package was not found.'
+          }
+          $checksum = "$($package.FullName).sha256"
+          gh release create "v$version" $package.FullName $checksum `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "YMM4 Radeon (AMF) v$version" `
+            --generate-notes `
+            --latest

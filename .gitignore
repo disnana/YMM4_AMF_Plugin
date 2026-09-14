@@ -42,6 +42,7 @@ YukkuriMovieMaker_v4_Lite/
 test_video/
 PLAN.md
 dist/
+artifacts/
 vendor/
 NVEncC_*/
 NVEncC_*.7z
