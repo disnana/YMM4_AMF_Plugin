@@ -1,26 +1,92 @@
 Third-Party Notices
 ===================
 
-This project uses or depends on the following third-party components.
-Redistribution status differs by component as noted below.
+These notices describe the AMF plugin package and distinguish source-derived
+components from external build/runtime dependencies. The project's own MIT
+license, including the upstream author's copyright, is in the accompanying
+LICENSE file.
 
-1) NVIDIA NVENC SDK
-   - Usage: NVENC API headers are required to build the native encoder module.
-   - Distribution: Not included. Obtain the SDK from NVIDIA and follow its EULA.
-
-2) YukkuriMovieMaker v4 (YMM4)
-   - Usage: This is a plugin for YMM4 and references YMM4 assemblies at build/runtime.
-   - Distribution: Not included. Use and distribution must comply with YMM4's terms.
-
-3) AMD Advanced Media Framework (AMF) SDK
-   - Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF
-   - Version: v1.5.2, commit eadd00804d5f7e5cd8c85d540073198312870776
-   - Usage: Public headers are used to build AmfNative.dll. The SDK repository is pinned as a Git submodule.
-   - Runtime: amfrt64.dll is provided by the installed AMD Radeon software and is not redistributed here.
-   - License: MIT. See third_party/AMF/LICENSE.txt after initializing submodules.
-   - Standards notice: The AMF license does not grant patent or other rights for H.264, HEVC, AAC, or other media standards.
-
-4) YMM4_NVEncPlugin
+1) YMM4_NVEncPlugin
    - Source: https://github.com/tarutaru247/YMM4_NVEncPlugin
    - Reference commit: c7cf16114be09faec877e74e12df36715e1d5881
-   - Usage: The YMM4 writer integration, Media Foundation AAC path, and MP4 writer were derived from the upstream MIT-licensed implementation.
+   - Usage: The YMM4 writer integration, Media Foundation AAC path, and MP4
+     writer were derived from this MIT-licensed implementation.
+   - Copyright (c) 2026 tarutaru247. The copyright and full MIT permission
+     notice are retained in the accompanying LICENSE file.
+
+2) AMD Advanced Media Framework (AMF) SDK
+   - Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF
+   - Version: v1.5.2, commit eadd00804d5f7e5cd8c85d540073198312870776
+   - Usage: Public headers are used to build AmfNative.dll. The SDK repository
+     is pinned as a Git submodule; it is not bundled in the .ymme package.
+   - License: The pinned SDK's LICENSE.txt is reproduced below, including its
+     standards notice. Other files in the SDK repository may have their own
+     notices; this package does not redistribute the entire SDK repository.
+   - Runtime: amfrt64.dll is provided by installed AMD Radeon software and is
+     not redistributed here. The SDK license is not a license for the entire
+     driver distribution.
+
+3) YukkuriMovieMaker v4 (YMM4) and host-provided assemblies
+   - Source: https://manjubox.net/ymm4/
+   - Usage: The plugin references YMM4, SharpGen.Runtime, and Vortice assemblies
+     from the user's YMM4 installation at build/runtime.
+   - Distribution: These assemblies are not included in the .ymme package.
+     Consult YMM4 and each component's accompanying terms and notices.
+
+4) Microsoft Windows components and Visual C++ runtime
+   - Usage: Windows Media Foundation supplies AAC encoding, and the native
+     plugin depends on Windows system libraries and the Visual C++ runtime.
+   - Distribution: Not included in the .ymme package. Obtain required runtime
+     components through Microsoft or the supported host installation.
+
+5) FFmpeg / ffprobe (optional validation tools)
+   - Usage: Development scripts invoke external tools to validate completed
+     output. The AMF plugin does not invoke or link FFmpeg for encoding.
+   - Distribution: Not included in the .ymme package. Follow the terms of the
+     particular FFmpeg build obtained separately.
+   - The FFmpeg sentence in the upstream AMF license reproduced below refers
+     to the AMF SDK distribution. This plugin uses AMF public headers, not the
+     SDK's FFmpeg components.
+
+6) NVIDIA NVENC SDK (legacy source only)
+   - Usage: The original NvencNative / NVEncVideoWriterPlugin projects remain
+     in the source tree. Building those projects requires NVIDIA's SDK and
+     compliance with its terms.
+   - AMF package: NVIDIA SDK headers, runtime, and legacy NVENC binaries are
+     not used by the AMF build scripts and are not included in the .ymme.
+
+AMD AMF SDK LICENSE.txt
+======================
+Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF/blob/eadd00804d5f7e5cd8c85d540073198312870776/LICENSE.txt
+
+Notice Regarding Standards.  AMD does not provide a license or sublicense to
+any Intellectual Property Rights relating to any standards, including but not
+limited to any audio and/or video codec technologies such as MPEG-2, MPEG-4;
+AVC/H.264; HEVC/H.265; AAC decode/FFMPEG; AAC encode/FFMPEG; VC-1; and MP3
+(collectively, the "Media Technologies"). For clarity, you will pay any
+royalties due for such third party technologies, which may include the Media
+Technologies that are owed as a result of AMD providing the Software to you.
+
+This software uses libraries from the FFmpeg project under the LGPLv2.1.
+
+MIT license
+
+Copyright (c) 2016 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

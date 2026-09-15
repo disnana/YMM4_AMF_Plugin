@@ -2,146 +2,124 @@
 
 [![Build and release](https://github.com/disnana/YMM4_AMF_Plugin/actions/workflows/ci-release.yml/badge.svg)](https://github.com/disnana/YMM4_AMF_Plugin/actions/workflows/ci-release.yml)
 
-YukkuriMovieMaker 4（YMM4）のD3D11描画結果を、AMD Advanced Media Framework（AMF）へ渡してH.264 / HEVCのMP4を書き出すWindows向けプラグインです。
+AMD Radeonのハードウェアエンコーダーを使い、ゆっくりMovieMaker4（YMM4）からMP4動画を書き出すプラグインです。映像はH.264 / H.265（HEVC）、音声はAACに対応しています。
 
-**Disnana Project / Developer: [tp-li-dev](https://github.com/tp-li-dev)**
+Disnana Projectとして、[tp-li-dev](https://github.com/tp-li-dev)が開発・保守しています。
 
-現在は **開発版** です。現在のバージョンは[`VERSION`](VERSION)を参照してください。AMFネイティブコア、所有テクスチャプール、非同期出力取得、AAC音声、MP4 mux、スタンドアロン実機ベンチまで実装されています。AMD Radeon RX 6800 XT環境では、YMM4によるプラグイン認識、設定UI、H.264の実書き出しと再生まで確認済みです。
+**[最新版をダウンロード](https://github.com/disnana/YMM4_AMF_Plugin/releases/latest)** — Assets内の`YMM4-Radeon-AMF-v<バージョン>.ymme`を選んでください。`Source code`は開発者向けで、インストール用ではありません。
 
-## 実装済み
+## 利用に必要なもの
 
-- YMM4の`ID2D1Bitmap1`から`ID3D11Texture2D`を取得する`IVideoFileWriter2`接続
-- 借用テクスチャを保持せず、4 / 6 / 8枚の所有BGRA/RGBAテクスチャへ`CopyResource`する安全な入力経路
-- 同じD3D11 deviceを使うAMF H.264 / HEVC encoder（AMF EFCによるRGB入力変換）
-- `SubmitInput`と専用`QueryOutput`スレッドによる非同期処理
-- 入力surfaceのスロットIDが出力へ戻ったことを確認してから再利用する所有権管理
-- Media Foundation AACとMP4 mux、正常Drain、全出力フレーム数の整合確認
-- `RadeonBench`によるprobe / 実機スモーク / JSON結果
-- 明示実行のビルド、GPUスモーク、ベンチ、YMM4 CLI adapterスクリプト
-- `amfrt64.dll`をSystem32からだけ読み込むDLL検索制限
+- Windows 11（x64）
+- [YMM4 / YMM4 Lite](https://manjubox.net/ymm4/)の.NET 10対応版。本プラグインの動作確認に使用した版はv4.56.1.0です。
+- AMFによるH.264 / HEVCエンコードに対応したAMD Radeon GPUと、そのGPUに対応するRadeonドライバー
+- Microsoft Visual C++ v14再頒布可能パッケージ（x64）。ランタイム不足のエラーが出る場合は[Microsoft公式配布ページ](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)から導入してください。
 
-## 未実装・未検証
+通常の利用にVisual Studio、.NET SDK、AMF SDK、NVIDIA SDK、検証用のffmpeg / ffprobeを別途用意する必要はありません。開発環境の準備は[CONTRIBUTING](https://github.com/disnana/YMM4_AMF_Plugin/blob/master/CONTRIBUTING.md)を参照してください。
 
-- 色差、VMAF、音声marker相互相関（frame marker順序照合は実装済み）
-- BT.709 / limited rangeの画素値検証（container metadataの自動検証は実装済み）
-- YMM4実プロジェクトでのL3比較と、標準出力に対する高速化率
-- キャンセルAPI、device removalの実機試験、長時間反復・VRAM plateau試験
-- コード署名、複数GPU・複数ドライバーでの互換性試験
-
-未実測の高速化率は主張しません。スタンドアロンの`completed_fps`はYMM4全体の書き出し速度ではありません。
+実機確認はWindows 11・Radeon RX 6800 XT環境で行っています。別のGPU・ドライバー・YMM4の版での動作は未確認です。最初は短い区間を出力し、映像と音声を確認してください。
 
 ## インストール
 
-1. [Releases](https://github.com/disnana/YMM4_AMF_Plugin/releases)から最新の`YMM4-Radeon-AMF-v*.ymme`をダウンロードする
-2. YMM4を終了する
-3. `.ymme`をダブルクリックし、YMM4のインストーラーに従う
-4. YMM4を起動し、動画出力で「Radeon (AMF) プラグイン出力」を選ぶ
+1. [最新版のRelease](https://github.com/disnana/YMM4_AMF_Plugin/releases/latest)を開き、Assetsから`.ymme`をダウンロードします。自分でZIPに圧縮し直す必要はありません。
+2. 作業中のプロジェクトを保存し、YMM4を終了します。
+3. ダウンロードした`.ymme`をダブルクリックし、インストーラーの案内に従います。YMM4を複数配置している場合は、普段使う配置先を確認してください。
+4. YMM4を起動します。
+5. 「ファイル」→「設定」→「プラグイン」→「プラグイン一覧」に「Radeon (AMF) プラグイン出力」が表示されることを確認します。
 
-インストーラーが開かない場合は、YMM4の「ヘルプ」→「YMM4用拡張子の関連付け」から関連付けを登録してください。
+`.ymme`でインストーラーが開かない場合は、YMM4を起動して「ヘルプ」→「YMM4用拡張子の関連付け」→「登録する」を実行します。その後YMM4を終了し、手順3からやり直してください。[YMM4公式のプラグイン導入手順](https://manjubox.net/ymm4/faq/plugin/how_to_use/)も参照できます。
 
-## 必要環境
+## 動画を書き出す
 
-- Windows 11 x64
-- AMF対応AMD Radeon GPUと対応Radeonドライバー
-- Visual Studio 2022（Desktop development with C++）
-- Windows 11 SDK 10.0.26100.0
-- .NET 10 SDK（YMM4プラグインをビルドする場合）
-- YMM4本体のDLL（リポジトリへは含めません）
-- ffmpeg / ffprobe（完成出力の全decode検証。エンコード自体には不要）
+1. YMM4でプロジェクトを開き、保存します。
+2. 「ファイル」→「動画出力」を開きます。
+3. 「全般」内の「動画出力」で「Radeon (AMF) プラグイン出力」を選びます。
+4. 初回は「H.264」「6 枚」「自動 (YouTube 推奨)」「標準」の既定設定で試してください。
+5. 必要に応じて出力範囲・音量などのYMM4側の設定を確認し、「出力」から保存先のMP4ファイルを指定します。テスト時は既存の動画と別名にしてください。
+6. 完了したMP4を再生し、冒頭と末尾の映像・音声・同期を確認します。
 
-AMF SDKはsubmoduleとしてv1.5.2のcommit `eadd00804d5f7e5cd8c85d540073198312870776`に固定しています。
+出力解像度の幅と高さは、どちらも正の偶数が必要です（例：1920×1080、1080×1920）。解像度と完成動画のfpsはYMM4側の設定を使用します。[YMM4公式の動画出力手順](https://manjubox.net/ymm4/faq/動画出力/動画を出力する/)も参照してください。
 
-```powershell
-git clone --recurse-submodules https://github.com/disnana/YMM4_AMF_Plugin.git
-```
+### プラグインの設定
 
-既にclone済みの場合:
+| 項目 | 既定値 | 説明 |
+| --- | --- | --- |
+| コーデック | H.264 | `H.264` / `H.265 (HEVC)`。まずはH.264で確認してください。HEVCはGPUと再生先の両方が対応している必要があります。 |
+| 所有テクスチャプール | 6 枚 | 処理中の映像を保持するバッファー数。`4 枚` / `6 枚` / `8 枚`から選びます。枚数を増やすとGPUメモリ使用量も増えますが、必ず速くなるわけではありません。 |
+| デバッグログを書き出す | オフ | エラー調査時にオンにしてから出力します。保存先は後述。 |
+| ビットレート方式 | 自動 (YouTube 推奨) | 自動は映像の高さとfpsに応じた内蔵の目安でVBR出力します。手動指定には`固定 (CBR)`または`可変 (VBR)`を選びます。 |
+| 出力品質 | 標準 | `高速` / `標準` / `高品質`のエンコーダー設定。速度と画質の変化は素材やGPUによって異なります。 |
+| ビットレート（kbps） | 手動用の初期値は12000 | CBR / VBR選択時に入力できます。設定範囲は100〜200000kbpsですが、GPU側の対応範囲には別の制約があります。 |
 
-```powershell
-git submodule update --init --recursive
-```
+自動設定ではビットレート欄は編集できません。欄に表示された`12000`などの数値が、そのまま実際の自動設定値になるとは限りません。「YouTube 推奨」はUI上の名称で、YouTubeから最新の推奨値を取得する機能ではありません。
 
-## ビルドと検証
+設定のファイル保存は未実装のため、YMM4を再起動した後は出力設定を確認してください。
 
-通常のビルドはYMM4のpluginフォルダーを変更しません。
+## 更新・削除
 
-```powershell
-.\scripts\Build.ps1 -Configuration Release
-.\scripts\Run-Tests.ps1 -Suite Unit
-.\scripts\Run-Tests.ps1 -Suite GpuSmoke
-```
+### 更新する
 
-`GpuSmoke`はffmpeg / ffprobeを必須とし、H.264 / HEVCを各120フレーム、AAC音声付きで作成します。映像フレーム数、全decode、画像内16-bit frame markerの順序、BT.709 / limited rangeメタデータ、音声形式と映像・音声duration差（50ms以内）を検証します。GPUや外部ツールがない状態を成功へ読み替えません。音声marker相互相関と色差測定はまだ行いません。
+プラグイン内の自動更新には対応していません。
 
-固定configの反復ベンチ:
+1. [Releases](https://github.com/disnana/YMM4_AMF_Plugin/releases)で変更内容を確認し、新しい`.ymme`をダウンロードします。
+2. プロジェクトを保存してYMM4を終了します。
+3. インストール時と同じYMM4を対象に、新しい`.ymme`をインストールします。
+4. YMM4を起動し、短い区間を別名で出力して確認します。
 
-```powershell
-.\scripts\Run-Benchmarks.ps1 -Config .\bench\configs\comparison.json
-```
+標準の配置先は`YMM4フォルダ\user\plugin\AMFVideoWriterPlugin`です。その中の`VERSION`で配置済みパッケージの版を確認できます。手動で差し替える場合も、`AMFPlugin.dll`と`AmfNative.dll`は同じ配布パッケージの組で使ってください。旧実験版と新しいDLLを混在させないでください。
 
-結果は`artifacts/runs/`へJSON / CSVで保存されます。
+### 削除する・以前の版へ戻す
 
-## 配布パッケージと自動リリース
+YMM4を終了し、上記の`AMFVideoWriterPlugin`フォルダーだけを`user\plugin`の外へ退避すると、読み込まれなくなります。不要になったら退避したフォルダーを削除できます。YMM4本体や他のプラグイン、プロジェクト・素材フォルダーは削除しないでください。
 
-YMM4公式サンプルの配布方式に合わせ、プラグイン用サブフォルダをZIP化して拡張子を`.ymme`にしています。YMM4本体のDLLはパッケージへ含めません。
+以前の版へ戻す場合は、現在のプラグインを退避してから、[Releases](https://github.com/disnana/YMM4_AMF_Plugin/releases)の該当版をインストールします。
 
-ローカルで配布物を作成する場合:
+## 困ったとき
 
-```powershell
-.\scripts\Package-Plugin.ps1 -Configuration Release -Ymm4Directory 'C:\path\to\YukkuriMovieMaker_v4'
-```
+| 症状 | 確認すること |
+| --- | --- |
+| プラグインが一覧に出ない | インストール先のYMM4、対応版、再起動を確認します。同名プラグインを複数のフォルダーに手動配置していないかも確認してください。 |
+| `VCRUNTIME140` / `MSVCP140`などが見つからない | 上記のVisual C++再頒布可能パッケージ（x64）を導入・修復します。個別のDLLを非公式サイトから入手しないでください。 |
+| AMFの初期化に失敗する | Radeonドライバーと選択したコーデックへの対応を確認します。本プラグインはYMM4が使用するGPUを引き継ぐため、複数GPU環境ではYMM4が使うGPUも確認してください。 |
+| 偶数サイズが必要というエラー | YMM4側の出力解像度を確認します。幅・高さのどちらかが奇数だと出力できません。 |
+| HEVCの動画を再生できない | 再生環境のHEVC対応を確認します。切り分けにはH.264での出力を試してください。 |
+| 出力途中で失敗する・完了しない | プロジェクトを保存し、デバッグログを有効にして短い区間で再現を確認します。ログとエラー全文を添えて報告してください。 |
+| 期待した速度が出ない | プロジェクトの描画負荷、解像度、GPUの同時利用などで速度は変わります。標準出力より常に速いことや、一定のfpsは保証していません。 |
 
-次の2ファイルが`artifacts/release/`へ生成されます。
+急ぎの出力では、出力方式をYMM4標準のものへ戻して切り分けてください。
 
-- `YMM4-Radeon-AMF-v<version>.ymme`
-- `YMM4-Radeon-AMF-v<version>.ymme.sha256`
+### デバッグログの場所
 
-GitHub Actionsはpushとpull requestのたびに、公式配布元のYMM4 Liteをビルド参照として一時取得し、ネイティブDLL、管理DLL、`.ymme`の生成を検証します。`master`へのpush時に`VERSION`が最新の公開済みSemVerタグより大きい場合、`v<version>`タグとGitHub Releaseを自動作成して`.ymme`とSHA-256を添付します。現在の`VERSION`と同じタグが既にあればReleaseは作らず、巻き戻しはエラーにします。
+「デバッグログを書き出す」をオンにすると、動画と同じフォルダーに、出力ファイル名へ`.amf_log.txt`を付けたログが作られます。
 
-## YMM4プラグインのビルドと配置
+例：`テスト.mp4`を出力した場合は`テスト.mp4.amf_log.txt`です。MP4の出力に失敗しても、ログが残っていれば調査に使えます。ただし、DLLの読み込み以前の失敗や保存先へ書き込めない場合などは、ログが作られないこともあります。
 
-YMM4の配置を明示してビルドします。
+同じ出力名のログには追記されます。再現テストごとに別の出力名を使うと比較しやすくなります。調査後はチェックを外してください。
 
-```powershell
-.\scripts\Build.ps1 -Configuration Release -IncludePlugin -Ymm4Directory 'C:\path\to\YukkuriMovieMaker_v4'
-```
+### 不具合を報告する
 
-管理プラグインのビルドが成功すると、`AMFPlugin.dll`と同じ構成の`AmfNative.dll`はMSBuildの後処理で`artifacts/bin/`へ自動配置されます。手動コピーは不要です。
+[このプロジェクトのIssues](https://github.com/disnana/YMM4_AMF_Plugin/issues)へ、次を添えてください。
 
-YMM4へ配置する操作は別スクリプトです。対象を確認するには最初に`-WhatIf`を利用できます。
+- プラグインのバージョン、YMM4のバージョン、Windowsのバージョン
+- GPU名とRadeonドライバーのバージョン
+- 解像度・fps・コーデック・ビットレート方式・出力品質・プール枚数
+- 再現手順、期待した結果、実際の結果、エラー全文、該当するデバッグログ
+- 可能なら、共有可能な素材だけで作った短い再現プロジェクト
 
-```powershell
-.\scripts\Deploy-Plugin.ps1 -Ymm4Directory 'C:\path\to\YukkuriMovieMaker_v4' -WhatIf
-.\scripts\Deploy-Plugin.ps1 -Ymm4Directory 'C:\path\to\YukkuriMovieMaker_v4'
-```
+ログやYMM4のエラーレポートには、ファイルパス・ユーザー名・連絡先などが含まれる場合があります。公開前に内容を確認し、個人情報や非公開の素材を除いてください。
 
-YMM4のCLI引数は推測しません。対象版で確認した引数配列をローカルprofile JSONへ保存し、次のadapterへ渡します。
+## 動作確認の範囲
 
-```powershell
-.\scripts\Run-YmmBench.ps1 -Profile .\bench\configs\ymm-local.json
-```
+v0.1.1では、RX 6800 XT上でYMM4からのH.264出力と再生を確認しています。単体の検証ツールではH.264 / HEVC、AAC、全フレームのデコード、フレーム順序、色メタデータ、映像・音声の長さの整合を確認しました。
 
-## 設計上の安全境界
+HEVCのYMM4実プロジェクト出力、画素値による色・画質評価、長時間反復、キャンセル時の挙動、複数GPU・ドライバーの網羅検証は未完了です。実験的なVideoProcessor入力経路（P2）はv0.1.1で廃止しています。
 
-YMM4から受け取るテクスチャは次フレームで再利用される可能性があるため、AMFへ直接保持させません。`WriteVideo`の呼び出し中に同じdeviceのImmediateContextで所有textureへコピーし、以降はその所有textureだけを非同期処理します。AMF出力に伝播したslot IDを取得するまで、そのslotは再利用しません。
+測定条件と検証済み・未検証の詳細は[実測記録](https://github.com/disnana/YMM4_AMF_Plugin/blob/master/docs/benchmarks/2026-09-14-rx6800xt.md)にまとめています。単体ベンチマークのfpsは、YMM4全体の書き出し速度ではありません。
 
-詳細は[docs/architecture.md](docs/architecture.md)を参照してください。
+## ライセンス・開発への参加
 
-## 2026-09-14の開発環境スモーク
+本プラグインのコードは[MIT License](LICENSE)です。原実装[YMM4_NVEncPlugin](https://github.com/tarutaru247/YMM4_NVEncPlugin)の著作権表示を維持しています。第三者コードの由来とAMF SDKのライセンス全文は[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)に収録しています。
 
-AMD Radeon RX 6800 XTで次を確認しました。
+動画制作で本プラグインを使うだけなら、本プラグイン独自の料金やクレジット表記義務はありません。YMM4本体、音声・画像・楽曲などの素材、コーデックに関する条件は別途確認してください。改変・再配布時の条件を含め、[ライセンスの案内](https://github.com/disnana/YMM4_AMF_Plugin/blob/master/docs/licensing.md)に整理しています。
 
-- H.264、640x360、60fps、120フレーム: MP4 close成功、ffprobeで120フレーム、ffmpeg全decodeエラーなし
-- H.264 + AAC stereo 48kHz: 映像120フレーム、AAC stream、ffmpeg全decodeエラーなし
-- HEVC、640x360、60fps、120フレーム: MP4 close成功、ffprobeで120フレーム、ffmpeg全decodeエラーなし
-- YMM4で「Radeon (AMF) プラグイン出力」を認識し、H.264 MP4の実書き出しと再生に成功
-- H.264、1920x1080、60fps、900フレーム、各5回: pool 4 / 6 / 8の全15出力で全decode、frame marker順序、BT.709 / limited metadata検証に成功。中央値は248.9 / 277.1 / 276.0fps
-- 実験したVideoProcessor経路は、同じ7,259フレームのYMM4実出力で既存経路より約7%低速だったため廃止
-
-pool 6はpool 4よりstandalone中央値が約11.3%高く、pool 8と同等だったため、新規設定の既定値を6としています。詳細は[実測記録](docs/benchmarks/2026-09-14-rx6800xt.md)を参照してください。これはstandaloneスモークと基本的なYMM4 E2Eです。画質同等性、YMM4実負荷での安定性、標準出力に対する速度優位を証明する結果ではありません。
-
-## ライセンスと由来
-
-本リポジトリはMIT Licenseです。元になった[YMM4_NVEncPlugin](https://github.com/tarutaru247/YMM4_NVEncPlugin)のMITコード（固定点`c7cf16114be09faec877e74e12df36715e1d5881`）から、YMM4接続、AAC、MP4 muxの構造を継承しています。AMF SDKもMIT Licenseですが、H.264 / HEVC / AAC等の標準に関する権利をAMDが付与するものではありません。詳細は`LICENSE`と`THIRD_PARTY_NOTICES.txt`を確認してください。
-
-本AMF版はDisnana Projectとして[tp-li-dev](https://github.com/tp-li-dev)が開発・保守しています。原実装の著作権表示とMITライセンスは維持しています。
+不具合修正・ドキュメント改善・動作報告も歓迎します。開発環境、ビルド、検証、PR、CIリリースの手順は[CONTRIBUTING](https://github.com/disnana/YMM4_AMF_Plugin/blob/master/CONTRIBUTING.md)を参照してください。
