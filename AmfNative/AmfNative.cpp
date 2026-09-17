@@ -1,4 +1,5 @@
 #include "AmfNative.h"
+#include "AmfProfiling.h"
 
 #define NOMINMAX
 #include <windows.h>
@@ -185,6 +186,7 @@ namespace
 
     struct EncoderState
     {
+        AmfProfiler profile;
         HMODULE amfModule = nullptr;
         amf::AMFFactory* factory = nullptr;
         amf_uint64 runtimeVersion = 0;
@@ -199,6 +201,7 @@ namespace
             amf::AMFSurfacePtr surface;
             bool inFlight = false;
             uint64_t frameId = 0;
+            uint64_t profileStart = 0;
 
             ~FrameSlot()
             {
@@ -1376,6 +1379,7 @@ namespace
 
     bool FinalizeMp4(EncoderState* state)
     {
+        AmfProfileScope profileScope(state->profile, AmfProfileStage::Mp4Finalize);
         if (!state->writerInitialized || state->mp4Finalized)
         {
             return true;
@@ -3181,6 +3185,12 @@ namespace
         {
             std::lock_guard<std::mutex> lock(state->slotMutex);
             auto& slot = state->slots[static_cast<size_t>(slotIndex)];
+            if (slot->profileStart != 0)
+            {
+                state->profile.metrics[AmfProfileStage::SlotResidence].Add(AmfProfiler::Now() - slot->profileStart);
+                state->profile.completed.fetch_add(1, std::memory_order_relaxed);
+                slot->profileStart = 0;
+            }
             slot->inFlight = false;
             ++state->completedFrames;
         }
@@ -3197,13 +3207,16 @@ namespace
             while (!state->outputStop)
             {
                 amf::AMFDataPtr data;
+                AmfProfileScope queryScope(state->profile, AmfProfileStage::QueryOutput);
                 AMF_RESULT result = state->encoder->QueryOutput(&data);
+                queryScope.Stop();
                 if (result == AMF_EOF)
                 {
                     break;
                 }
                 if (result == AMF_REPEAT || result == AMF_NEED_MORE_INPUT || (result == AMF_OK && data == nullptr))
                 {
+                    AmfProfileScope pollScope(state->profile, AmfProfileStage::OutputPollWait);
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
@@ -3239,7 +3252,10 @@ namespace
                 }
 
                 {
+                    AmfProfileScope muxWaitScope(state->profile, AmfProfileStage::OutputMuxWait);
                     std::lock_guard<std::mutex> muxLock(state->muxMutex);
+                    muxWaitScope.Stop();
+                    AmfProfileScope bitstreamScope(state->profile, AmfProfileStage::BitstreamMux);
                     if (!ProcessEncodedBitstream(state, static_cast<const uint8_t*>(buffer->GetNative()), buffer->GetSize(), keyframe))
                     {
                         state->outputError = true;
@@ -3377,6 +3393,7 @@ namespace
 
         size_t slotIndex = 0;
         {
+            AmfProfileScope slotWaitScope(state->profile, AmfProfileStage::SlotWait);
             std::unique_lock<std::mutex> lock(state->slotMutex);
             const bool ready = state->slotCv.wait_for(lock, std::chrono::seconds(30), [state]()
             {
@@ -3398,6 +3415,8 @@ namespace
                     slotIndex = candidate;
                     state->slots[candidate]->inFlight = true;
                     state->slots[candidate]->frameId = state->frameIndex;
+                    if (state->profile.enabled.load(std::memory_order_relaxed))
+                        state->slots[candidate]->profileStart = AmfProfiler::Now();
                     state->nextSlot = (candidate + 1) % state->slots.size();
                     found = true;
                     break;
@@ -3411,7 +3430,9 @@ namespace
         }
 
         auto& slot = state->slots[slotIndex];
+        AmfProfileScope copyScope(state->profile, AmfProfileStage::CopyResourceCpu);
         state->deviceContext->CopyResource(slot->texture, texture);
+        copyScope.Stop();
         const amf_pts pts = static_cast<amf_pts>((state->frameIndex * AMF_SECOND) / static_cast<uint64_t>(state->fps));
         const amf_pts duration = static_cast<amf_pts>(AMF_SECOND / state->fps);
         slot->surface->SetPts(pts);
@@ -3428,9 +3449,13 @@ namespace
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         for (;;)
         {
+            AmfProfileScope submitScope(state->profile, AmfProfileStage::SubmitInput);
             AMF_RESULT result = state->encoder->SubmitInput(slot->surface);
+            submitScope.Stop();
             if (result == AMF_OK)
             {
+                if (state->profile.enabled.load(std::memory_order_relaxed))
+                    state->profile.accepted.fetch_add(1, std::memory_order_relaxed);
                 ++state->acceptedFrames;
                 ++state->frameIndex;
                 return true;
@@ -3441,11 +3466,14 @@ namespace
                 break;
             }
             ++state->inputFullCount;
+            if (state->profile.enabled.load(std::memory_order_relaxed))
+                state->profile.retries.fetch_add(1, std::memory_order_relaxed);
             if (state->outputError || std::chrono::steady_clock::now() >= deadline)
             {
                 SetError(state, L"Timed out while the AMF input queue was full.");
                 break;
             }
+            AmfProfileScope retryScope(state->profile, AmfProfileStage::InputRetryWait);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
@@ -3491,6 +3519,7 @@ namespace
                     continue;
                 }
 
+                AmfProfileScope sampleScope(state->profile, AmfProfileStage::WriterSample);
                 std::lock_guard<std::mutex> fileLock(state->fileMutex);
                 uint64_t offset = state->file.Tell();
                 if (!state->file.Write(sample.data.data(), sample.data.size()))
@@ -3879,6 +3908,7 @@ int AmfWriteAudio(void* handle, const float* samples, int sampleCount, int sampl
         return 1;
     }
 
+    AmfProfileScope audioScope(state->profile, AmfProfileStage::AudioWrite);
     std::lock_guard<std::mutex> muxLock(state->muxMutex);
     if (!InitializeAudioEncoder(state, sampleRate, channels))
     {
@@ -3920,6 +3950,7 @@ int AmfFinalize(void* handle)
     {
         return 0;
     }
+    AmfProfileScope finalizeScope(state->profile, AmfProfileStage::Finalize);
     if (state->mp4Finalized)
     {
         return state->lastError.empty() ? 1 : 0;
@@ -4044,4 +4075,20 @@ const wchar_t* AmfGetLastError(void* handle)
 {
     auto* state = reinterpret_cast<EncoderState*>(handle);
     return state ? state->lastError.c_str() : L"";
+}
+
+int AmfEnableProfiling(void* handle)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || state->frameIndex != 0 || state->drainRequested) return 0;
+    state->profile.enabled.store(true, std::memory_order_relaxed);
+    return 1;
+}
+
+int AmfGetProfile(void* handle, AmfProfileSnapshot* result, uint32_t resultSize)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(AmfProfileSnapshot)) return 0;
+    *result = state->profile.Snapshot();
+    return 1;
 }

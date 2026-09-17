@@ -1,4 +1,5 @@
 #include "../AmfNative/AmfNative.h"
+#include "../AmfNative/AmfProfiling.h"
 
 #define NOMINMAX
 #include <windows.h>
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <thread>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -38,6 +40,8 @@ namespace
         int rateControl = 1;
         int poolSize = 4;
         bool audio = false;
+        bool profile = false;
+        bool debugLog = true;
     };
 
     std::string Utf8(const std::wstring& value)
@@ -91,6 +95,8 @@ namespace
         for (int i = 2; i < argc; ++i)
         {
             const std::wstring key = argv[i];
+            if (key == L"--profile") { options.profile = true; continue; }
+            if (key == L"--no-debug-log") { options.debugLog = false; continue; }
             if (key == L"--audio")
             {
                 options.audio = true;
@@ -131,7 +137,7 @@ namespace
             }
             else return false;
         }
-        return options.command == L"probe" || options.command == L"run";
+        return options.command == L"probe" || options.command == L"run" || options.command == L"profile-self-test";
     }
 
     bool CreateDevice(ID3D11Device** device, ID3D11DeviceContext** context, std::wstring& adapterName, std::wstring& error)
@@ -214,8 +220,27 @@ namespace
         if (!parent.empty()) std::filesystem::create_directories(parent);
     }
 
+    void WriteProfile(std::ofstream& file, const AmfProfileSnapshot* profile)
+    {
+        if (!profile) { file << "null"; return; }
+        file << "{\"version\":" << profile->version << ",\"accepted_frames\":" << profile->acceptedFrames
+            << ",\"completed_frames\":" << profile->completedFrames << ",\"input_retries\":" << profile->inputRetries
+            << ",\"stages\":{";
+        for (uint32_t i = 0; i < AmfProfileStageCount; ++i)
+        {
+            const auto& metric = profile->metrics[i];
+            const double totalMs = metric.totalNanoseconds / 1000000.0;
+            if (i) file << ',';
+            file << '\"' << AmfProfileStageNames[i] << "\":{\"count\":" << metric.count
+                << ",\"total_ms\":" << totalMs << ",\"mean_ms\":" << (metric.count ? totalMs / metric.count : 0)
+                << ",\"max_ms\":" << metric.maxNanoseconds / 1000000.0 << '}';
+        }
+        file << "}}";
+    }
+
     void WriteResult(const Options& options, const std::wstring& status, const std::wstring& reason,
-        const std::wstring& adapterName, amf_uint64 runtimeVersion, double wallMs, int acceptedFrames)
+        const std::wstring& adapterName, amf_uint64 runtimeVersion, double wallMs, int acceptedFrames,
+        const AmfProfileSnapshot* profile = nullptr)
     {
         EnsureParent(options.result);
         std::ofstream file(std::filesystem::path(options.result), std::ios::binary | std::ios::trunc);
@@ -234,10 +259,14 @@ namespace
             << ", \"rate_control\": \"" << (options.rateControl == 0 ? "cbr" : "vbr")
             << "\", \"quality_intent\": \"" << (options.quality == 0 ? "speed" : options.quality == 2 ? "quality" : "balanced")
             << "\", \"target_bitrate_kbps\": " << options.bitrateKbps
-            << ", \"max_bitrate_kbps\": " << options.maxBitrateKbps << "},\n"
+            << ", \"max_bitrate_kbps\": " << options.maxBitrateKbps
+            << ", \"profiling\": " << (options.profile ? "true" : "false")
+            << ", \"debug_log\": " << (options.debugLog ? "true" : "false") << "},\n"
             << "  \"metrics\": {\"export_wall_ms\": " << wallMs << ", \"accepted_frames\": "
             << acceptedFrames << ", \"completed_fps\": " << completedFps << "},\n"
-            << "  \"validation\": {\"decode\": \"not_run_missing_dependency\", \"frame_order\": \"not_run\", \"color\": \"not_run\", \"audio_sync\": \"not_run\"}\n"
+            << "  \"profiling\": ";
+        WriteProfile(file, profile);
+        file << ",\n  \"validation\": {\"decode\": \"not_run_missing_dependency\", \"frame_order\": \"not_run\", \"color\": \"not_run\", \"audio_sync\": \"not_run\"}\n"
             << "}\n";
     }
 
@@ -290,9 +319,11 @@ namespace
         EnsureParent(options.output);
         void* encoder = error.empty() ? AmfCreate(device, options.width, options.height, options.fps,
             options.bitrateKbps, options.codec, options.quality, options.rateControl, options.maxBitrateKbps,
-            3, options.poolSize, 1, options.output.c_str()) : nullptr;
+            3, options.poolSize, options.debugLog ? 1 : 0, options.output.c_str()) : nullptr;
         if (encoder && AmfGetLastError(encoder)[0] != L'\0') error = AmfGetLastError(encoder);
         if (!encoder && error.empty()) error = L"AmfCreate returned null";
+        if (encoder && error.empty() && options.profile && !AmfEnableProfiling(encoder))
+            error = L"Failed to enable profiling";
 
         std::vector<uint8_t> pixels(static_cast<size_t>(options.width) * options.height * 4);
         std::vector<float> audioSamples;
@@ -331,14 +362,40 @@ namespace
         const auto end = std::chrono::steady_clock::now();
         const double wallMs = std::chrono::duration<double, std::milli>(end - start).count();
 
+        AmfProfileSnapshot profile{};
+        bool hasProfile = encoder && options.profile && AmfGetProfile(encoder, &profile, sizeof(profile)) != 0;
+        if (options.profile && !hasProfile && error.empty()) error = L"Profiling snapshot unavailable";
+
         if (encoder) AmfDestroy(encoder);
         if (texture) texture->Release();
         if (context) context->Release();
         if (device) device->Release();
 
         const bool passed = error.empty() && acceptedFrames == options.frames;
-        WriteResult(options, passed ? L"passed" : L"failed", error, adapterName, runtimeVersion, wallMs, acceptedFrames);
+        WriteResult(options, passed ? L"passed" : L"failed", error, adapterName, runtimeVersion, wallMs, acceptedFrames,
+            hasProfile ? &profile : nullptr);
         return passed ? 0 : 3;
+    }
+
+    int ProfileSelfTest()
+    {
+        AmfProfiler profiler;
+        { AmfProfileScope disabled(profiler, AmfProfileStage::SubmitInput); }
+        if (profiler.Snapshot().metrics[AmfProfileStage::SubmitInput].count != 0) return 4;
+        profiler.enabled = true;
+        { AmfProfileScope enabled(profiler, AmfProfileStage::SubmitInput); enabled.Stop(); }
+        if (profiler.Snapshot().metrics[AmfProfileStage::SubmitInput].count != 1) return 4;
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i)
+            threads.emplace_back([&]() { for (int j = 0; j < 10000; ++j) profiler.metrics[AmfProfileStage::SlotWait].Add(100); });
+        for (auto& thread : threads) thread.join();
+        const auto snapshot = profiler.Snapshot();
+        const auto& metric = snapshot.metrics[AmfProfileStage::SlotWait];
+        if (metric.count != 40000 || metric.totalNanoseconds != 4000000 || metric.maxNanoseconds != 100) return 4;
+        AmfProfileSnapshot output{};
+        if (AmfEnableProfiling(nullptr) || AmfGetProfile(nullptr, &output, sizeof(output))) return 4;
+        std::cout << "Native profiling counters, disabled mode, concurrency and ABI checks: passed\n";
+        return 0;
     }
 }
 
@@ -349,11 +406,13 @@ int wmain(int argc, wchar_t** argv)
     {
         std::wcerr << L"Usage:\n"
             << L"  RadeonBench probe [--result probe.json]\n"
+            << L"  RadeonBench profile-self-test\n"
             << L"  RadeonBench run [--output output.mp4] [--result run.json] [--codec h264|hevc]\n"
             << L"                  [--width N] [--height N] [--fps N] [--frames N] [--bitrate-kbps N]\n"
             << L"                  [--max-bitrate-kbps N] [--rate-control cbr|vbr] [--quality speed|balanced|quality]\n"
-            << L"                  [--pool-size 4|6|8] [--audio]\n";
+            << L"                  [--pool-size 4|6|8] [--audio] [--profile] [--no-debug-log]\n";
         return 1;
     }
+    if (options.command == L"profile-self-test") return ProfileSelfTest();
     return options.command == L"probe" ? Probe(options) : Run(options);
 }
