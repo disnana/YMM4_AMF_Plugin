@@ -19,7 +19,7 @@ YMM4本体、私有プロジェクト、有償素材、個人情報入りログ�
 - Visual Studio 2022またはBuild ToolsのMSBuild、C++デスクトップ開発ワークロード、MSVC v143
 - Windows SDK `10.0.26100.0`（ネイティブプロジェクトで指定）
 - .NET 10 SDK
-- [公式配布のYMM4 / YMM4 Lite](https://manjubox.net/ymm4/)の.NET 10対応版と、その本体フォルダー（v4.56.1.0で確認）
+- [公式配布のYMM4 / YMM4 Lite](https://manjubox.net/ymm4/)の.NET 10対応版と、その本体フォルダー。v0.2.0は`IVideoFileWriter3`が必要です（v4.56.1.1でビルド確認）。古いSDK参照ではコンパイルできません。
 - 実機出力の検証にはAMF対応Radeonとドライバー、`ffmpeg` / `ffprobe`をPATHから実行できる環境
 
 AMF SDKはGit submoduleとしてv1.5.2のcommit `eadd00804d5f7e5cd8c85d540073198312870776`に固定しています。AMF版のビルドにNVIDIA SDKは不要です。YMM4のDLLは手元の配置先を参照し、リポジトリや配布パッケージには含めません。
@@ -67,19 +67,19 @@ YMM4へ配置して試すときはYMM4を終了し、次を実行します。
 ### CPU側の契約テスト
 
 ```powershell
-.\scripts\Run-Tests.ps1 -Suite Unit
+.\scripts\Run-Tests.ps1 -Suite Unit -Ymm4Directory $amfYmm4Directory
 git diff --check
 ```
 
-`Unit`はReleaseのネイティブビルド、PowerShell構文、必須引数・不正プール枚数に対するCLIの拒否動作を検査します。すべてのエンコーダー処理を網羅する単体テストではなく、GPUでの出力成功も証明しません。
+`Unit`はReleaseビルド、PowerShell構文、CLIの引数検査、ネイティブ計測カウンターの並行集計、管理側の集計・破棄モード・UI設定のテストを実施します。管理側テストにはYMM4の参照DLLが必要です。破棄モードのテストではネイティブDLL呼び出しを禁止し、テクスチャに触れず音声を保持せず、MP4も作らないことを検査します。GPUでの出力成功を証明するものではありません。
 
 ### GPUスモークテスト
 
 ```powershell
-.\scripts\Run-Tests.ps1 -Suite GpuSmoke
+.\scripts\Run-Tests.ps1 -Suite GpuSmoke -Ymm4Directory $amfYmm4Directory
 ```
 
-H.264 / HEVCを各640×360・60fps・120フレーム、AAC音声付きで出力します。GPUや`ffmpeg` / `ffprobe`がなければ成功扱いにはしません。結果は`artifacts\runs\gpu-smoke`へ保存されます。
+H.264 / HEVCを各640×360・60fps・120フレーム、AAC音声付きで、プロファイリングのオフ・オン両方で出力します。ネイティブベンチ4ケースと、D2Dフレームを渡す管理側Writerの統合テスト8ケース（GPU直渡しOFF/ONも交差）を実行し、実際のP/Invoke経由で計測JSONも確認します。管理側はYMM4同様のv2 CpuReadコピー/v3直接入力を再現します。計測オンの場合はデバッグログをオフにし、カウンターと出力枚数の一致も検査します。GPUや`ffmpeg` / `ffprobe`がなければ成功扱いにはしません。結果は`artifacts\runs\gpu-smoke`へ保存されます。これはYMM4アプリ自体の実操作E2Eとは別のテストです。
 
 検証する項目は、MP4の正常終了、映像フレーム数、全デコード、画像内の16-bitフレームマーカーの順序、BT.709 / limited rangeメタデータ、音声形式、映像と音声のduration差（50ms以内）です。色の画素値、VMAF、音声マーカーの相互相関は検証対象に含まれていません。
 
@@ -105,6 +105,8 @@ CI、スタンドアロンGPUテスト、YMM4実プロジェクトの確認は�
 YMM4 CLI向けの`Run-YmmBench.ps1`は、`executable`、`arguments`配列、任意の`working_directory`を持つローカルJSONを実行するアダプターです。対象版で確認した引数だけを使用してください。共通のCLI引数や完成済みプロファイルは提供していません。私有パスを含むプロファイルは`artifacts`以下などのGit管理外に置きます。
 
 過去の結果は[実測記録](docs/benchmarks/2026-09-14-rx6800xt.md)を参照してください。
+
+YMM4の破棄モードとプロファイリング、区間の意味、ネイティブベンチの`--profile` / `--no-debug-log`は[プロファイリングガイド](docs/profiling.md)を参照してください。計測機能の負荷は、同じ条件でオフ・オンを交互に反復し、動画の検証後に評価してください。
 
 ## エンコード経路を変更する前に
 
@@ -146,7 +148,7 @@ YMM4・SharpGen・Vorticeの参照DLL、AMDの`amfrt64.dll`、ベンチツール
 
 リリース判定は`master`へのpush時だけです。現在の`VERSION`と同じタグがあれば再リリースしません。同じタグがなく、バージョンが既存の最新SemVerタグ以下ならエラーになります。`VERSION`の差分があるだけでリリースする仕組みではありません。PRや手動実行はビルド検証のみです。
 
-Release本文は現在GitHubの自動生成ノートです。`docs/release-notes`の本文を自動転載する処理はありません。既存の公開タグや添付ファイルは差し替えず、配布物を修正するときは新しい版を使用してください。
+Release本文は`docs/release-notes/v<version>.md`があればその内容を使用し、なければGitHubの自動生成ノートを使用します。既存の公開タグや添付ファイルは差し替えず、配布物を修正するときは新しい版を使用してください。
 
 ## 貢献コードのライセンス
 
