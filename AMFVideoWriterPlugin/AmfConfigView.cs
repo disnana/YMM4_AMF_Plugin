@@ -57,6 +57,17 @@ internal sealed class AmfConfigView : UserControl
         };
         panel.Children.Add(_poolSizeComboBox);
 
+        var gpuDirectCheckBox = new CheckBox
+        {
+            Content = "GPU直渡し（実験・IVideoFileWriter3）",
+            IsChecked = _settings.EnableGpuDirectInput,
+            ToolTip = "ON: YMM4の描画済みGPUフレームを直接受け取り、CPU読み取り用ビットマップへのコピーを省きます。AMFの所有テクスチャプールへのGPUコピーは維持します。設定は次に開始する出力に適用されます。",
+            Margin = new Thickness(0, 0, 0, 12),
+        };
+        gpuDirectCheckBox.Checked += (_, _) => _settings.EnableGpuDirectInput = true;
+        gpuDirectCheckBox.Unchecked += (_, _) => _settings.EnableGpuDirectInput = false;
+        panel.Children.Add(gpuDirectCheckBox);
+
         _codecComboBox.SelectionChanged += (_, _) =>
         {
             _settings.Codec = _codecComboBox.SelectedIndex switch
@@ -75,6 +86,33 @@ internal sealed class AmfConfigView : UserControl
         _debugLogCheckBox.Checked += (_, _) => _settings.EnableDebugLog = true;
         _debugLogCheckBox.Unchecked += (_, _) => _settings.EnableDebugLog = false;
         panel.Children.Add(_debugLogCheckBox);
+
+        var profilingCheckBox = new CheckBox
+        {
+            Content = "プロファイリング結果を書き出す（集計JSON）",
+            IsChecked = _settings.EnableProfiling,
+            ToolTip = "デバッグログとは独立した時間計測です。終了時に、出力名.amf_profile.jsonへ保存します。",
+            Margin = new Thickness(0, 0, 0, 8),
+        };
+        profilingCheckBox.Checked += (_, _) => _settings.EnableProfiling = true;
+        profilingCheckBox.Unchecked += (_, _) => _settings.EnableProfiling = false;
+        panel.Children.Add(profilingCheckBox);
+
+        var discardCheckBox = new CheckBox
+        {
+            Content = "計測専用：映像・音声を破棄（MP4を作成しない）",
+            IsChecked = _settings.DiscardOutput,
+            Margin = new Thickness(0, 0, 0, 4),
+        };
+        discardCheckBox.Checked += (_, _) => _settings.DiscardOutput = true;
+        discardCheckBox.Unchecked += (_, _) => _settings.DiscardOutput = false;
+        panel.Children.Add(discardCheckBox);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "破棄モードではプラグイン内のコピー・エンコード・動画保存を行いません。GPU直渡しOFFではYMM4側の入力前コピーが残ります。\n必ず新しい出力名を使い、集計JSONが必要ならプロファイリングもオンにしてください。",
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 12),
+        });
 
         panel.Children.Add(new TextBlock
         {

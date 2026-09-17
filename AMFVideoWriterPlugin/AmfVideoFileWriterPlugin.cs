@@ -32,7 +32,10 @@ public sealed class AmfVideoFileWriterPlugin : IVideoFileWriterPlugin
             Quality = _settings.Quality,
             RateControl = _settings.RateControl,
             TexturePoolSize = _settings.TexturePoolSize,
+            EnableGpuDirectInput = _settings.EnableGpuDirectInput,
             EnableDebugLog = _settings.EnableDebugLog,
+            DiscardOutput = _settings.DiscardOutput,
+            EnableProfiling = _settings.EnableProfiling,
         };
         return new AmfVideoFileWriter(path, videoInfo, snapshot);
     }

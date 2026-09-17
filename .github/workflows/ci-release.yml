@@ -51,7 +51,7 @@ jobs:
 
       - name: Build and validate CPU-side contracts
         shell: pwsh
-        run: ./scripts/Run-Tests.ps1 -Suite Unit
+        run: ./scripts/Run-Tests.ps1 -Suite Unit -Ymm4Directory '${{ steps.ymm4.outputs.directory }}'
 
       - name: Build distributable package
         shell: pwsh
@@ -122,9 +122,15 @@ jobs:
               throw 'Release package was not found.'
           }
           $checksum = "$($package.FullName).sha256"
+          $releaseNotes = "docs/release-notes/v$version.md"
+          $notesArguments = if (Test-Path -LiteralPath $releaseNotes -PathType Leaf) {
+              @('--notes-file', $releaseNotes)
+          } else {
+              @('--generate-notes')
+          }
           gh release create "v$version" $package.FullName $checksum `
             --repo $env:GITHUB_REPOSITORY `
             --target $env:GITHUB_SHA `
             --title "YMM4 Radeon (AMF) v$version" `
-            --generate-notes `
+            @notesArguments `
             --latest
