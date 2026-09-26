@@ -26,8 +26,8 @@ if ($settings.fps.den -ne 1) { throw 'RadeonBench currently supports only an int
 if ([int]$settings.fps.num -lt 1) { throw 'fps.num must be positive.' }
 if ([int]$settings.width -lt 2 -or [int]$settings.height -lt 2 -or ($settings.width % 2) -ne 0 -or ($settings.height % 2) -ne 0) { throw 'width and height must be positive even values.' }
 if ([int]$settings.frames -lt 1 -or [int]$settings.repeats -lt 1) { throw 'frames and repeats must be positive.' }
-$invalidPoolSizes = @($settings.pool_sizes | Where-Object { $_ -notin @(4, 6, 8) })
-if (@($settings.pool_sizes).Count -eq 0 -or $invalidPoolSizes.Count -gt 0) { throw 'pool_sizes must contain only 4, 6, or 8.' }
+$invalidPoolSizes = @($settings.pool_sizes | Where-Object { $_ -notin @(4, 6, 8, 16, 32, 64, 128) })
+if (@($settings.pool_sizes).Count -eq 0 -or $invalidPoolSizes.Count -gt 0) { throw 'pool_sizes must contain only 4, 6, 8, 16, 32, 64, or 128.' }
 if ($settings.codec -notin @('h264', 'hevc')) { throw 'codec must be h264 or hevc.' }
 if ($settings.rate_control -notin @('cbr', 'vbr')) { throw 'rate_control must be cbr or vbr.' }
 if ($settings.quality_intent -notin @('speed', 'balanced', 'quality')) { throw 'quality_intent is unsupported.' }

@@ -50,6 +50,12 @@ internal sealed class ExportProfiler
     }
 
     public object? NativeReport { get; set; }
+    public object? OutputWaitReport { get; set; }
+    public object? InputRecycleReport { get; set; }
+    public object? TexturePoolReport { get; set; }
+    public object? PipelineReport { get; set; }
+    public object? InputWaitReport { get; set; }
+    public object? MfStyleNv12Report { get; set; }
     public string NativeStatus { get; set; } = "not_initialized";
     public bool OutputFinalized { get; set; }
     public string InputDeliveryPath { get; set; } = "not_observed";
@@ -118,6 +124,12 @@ internal sealed class ExportProfiler
                 host_completion = "unknown_no_completion_signal",
                 output_finalized = OutputFinalized,
                 input_delivery_path = InputDeliveryPath,
+                output_wait = _discard ? new { status = "bypassed" } : OutputWaitReport ?? new { status = "not_initialized" },
+                input_recycling = _discard ? new { status = "bypassed" } : InputRecycleReport ?? new { status = "not_initialized" },
+                texture_pool = _discard ? new { status = "bypassed" } : TexturePoolReport ?? new { status = "not_initialized" },
+                pipeline = _discard ? new { status = "bypassed" } : PipelineReport ?? new { status = "not_initialized" },
+                input_full_wait = _discard ? new { status = "bypassed" } : InputWaitReport ?? new { status = "not_initialized" },
+                mf_style_nv12 = _discard ? new { status = "bypassed" } : MfStyleNv12Report ?? new { status = "not_initialized" },
                 configuration = _configuration,
                 metrics = new
                 {

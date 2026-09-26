@@ -1,5 +1,11 @@
 #include "AmfNative.h"
 #include "AmfProfiling.h"
+#include "AmfOutputWait.h"
+#include "AmfInputRecyclePool.h"
+#include "AmfTexturePoolPolicy.h"
+#include "AmfSubmissionQueue.h"
+#include "AmfInputWait.h"
+#include "AmfNv12Processor.h"
 
 #define NOMINMAX
 #include <windows.h>
@@ -15,6 +21,8 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <new>
+#include "AmfDeviceBridge.h"
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -27,6 +35,7 @@
 #include "public/include/components/Component.h"
 #include "public/include/components/VideoEncoderVCE.h"
 #include "public/include/components/VideoEncoderHEVC.h"
+#include "public/include/components/ColorSpace.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -187,25 +196,59 @@ namespace
     struct EncoderState
     {
         AmfProfiler profile;
+        AmfOutputWaitStatus outputWait{ 1, 0, 0, AmfOutputWaitDisabled, -1, -1, 0, 0 };
+        std::atomic<uint64_t> earlyPollWaits{ 0 };
+        std::atomic<uint64_t> highResolutionPollWaits{ 0 };
+        HANDLE outputPollTimer = nullptr;
+        std::shared_ptr<AmfInputRecyclePool> inputRecyclePool;
+        AmfTexturePoolStatus texturePoolStatus{}; // Dynamic legacy fields guarded by slotMutex.
         HMODULE amfModule = nullptr;
         amf::AMFFactory* factory = nullptr;
         amf_uint64 runtimeVersion = 0;
         amf::AMFContextPtr context;
         amf::AMFComponentPtr encoder;
-        amf::AMF_SURFACE_FORMAT surfaceFormat = amf::AMF_SURFACE_BGRA;
+        amf::AMF_SURFACE_FORMAT surfaceFormat = amf::AMF_SURFACE_BGRA; // Host/source format.
+        amf::AMF_SURFACE_FORMAT encoderSurfaceFormat = amf::AMF_SURFACE_BGRA;
         ID3D11Device* device = nullptr;
         ID3D11DeviceContext* deviceContext = nullptr;
+        ID3D11Device* sourceDevice = nullptr;
+        std::unique_ptr<AmfDeviceBridge> deviceBridge;
+        std::unique_ptr<AmfNv12Processor> nv12Processor;
+        bool mfStyleNv12 = false;
+        AmfMfStyleNv12Status mfStyleNv12Status{};
+        std::atomic<uint64_t> mfStyleNv12Conversions{ 0 }, mfStyleNv12Failures{ 0 };
+        AmfProfiler::Metric mfStyleNv12Cpu;
+        bool asyncSubmission = false, dedicatedDevice = false, adaptiveInputWait = false, pipelineInitialized = false;
+        std::shared_ptr<AmfInputWaitSignal> inputWaitSignal;
+        struct PreparedInput
+        {
+            amf::AMFSurfacePtr surface;
+            size_t slot = 0;
+            uint64_t ticket = 0, queueStart = 0;
+        };
+        std::unique_ptr<AmfSubmissionQueue<PreparedInput>> submitQueue;
+        std::thread submitThread;
+        std::atomic_bool submitStop{ false };
+        std::atomic<uint64_t> queuedFrames{ 0 };
+        AmfProfiler::Metric queueResidence;
         struct FrameSlot
         {
             ID3D11Texture2D* texture = nullptr;
+            ID3D11VideoProcessorOutputView* processorOutputView = nullptr;
             amf::AMFSurfacePtr surface;
             bool inFlight = false;
+            AmfSubmissionReturnGate returnGate;
             uint64_t frameId = 0;
             uint64_t profileStart = 0;
 
             ~FrameSlot()
             {
                 surface = nullptr;
+                if (processorOutputView)
+                {
+                    processorOutputView->Release();
+                    processorOutputView = nullptr;
+                }
                 if (texture)
                 {
                     texture->Release();
@@ -224,8 +267,8 @@ namespace
         std::atomic_bool outputError = false;
         std::atomic_bool drainRequested = false;
         std::atomic_bool outputStop = false;
-        uint64_t acceptedFrames = 0;
-        uint64_t completedFrames = 0;
+        std::atomic<uint64_t> acceptedFrames{ 0 };
+        std::atomic<uint64_t> completedFrames{ 0 };
         uint64_t inputFullCount = 0;
         std::mutex fileMutex;
         std::mutex muxMutex;
@@ -276,6 +319,7 @@ namespace
         IMFTransform* aacEncoder = nullptr;
         std::wstring outputPath;
         std::wstring lastError;
+        std::mutex errorMutex;
         bool logEnabled = false;
         HANDLE logFile = INVALID_HANDLE_VALUE;
     };
@@ -312,11 +356,20 @@ namespace
     void StartWriterThread(EncoderState* state);
     void StopWriterThread(EncoderState* state);
 
+    bool HasError(EncoderState* state)
+    {
+        std::lock_guard<std::mutex> lock(state->errorMutex);
+        return !state->lastError.empty();
+    }
+
     void SetError(EncoderState* state, const std::wstring& message)
     {
         if (state)
         {
-            state->lastError = message;
+            {
+                std::lock_guard<std::mutex> lock(state->errorMutex);
+                if (state->lastError.empty()) state->lastError = message; // Preserve the originating worker/driver failure.
+            }
             LogLine(state, L"[error] " + message);
         }
     }
@@ -1393,7 +1446,7 @@ namespace
         StopWriterThread(state);
         if (state->writerError)
         {
-            if (state->lastError.empty())
+            if (!HasError(state))
             {
                 SetError(state, L"Writer thread error.");
             }
@@ -1402,7 +1455,7 @@ namespace
 
         if (state->codecPrivate.empty())
         {
-            if (state->lastError.empty())
+            if (!HasError(state))
             {
                 SetError(state, L"Video codec header not found.");
             }
@@ -3104,6 +3157,30 @@ namespace
 #endif
 
     constexpr const wchar_t* kSlotIndexProperty = L"YMM4.AMF.SlotIndex";
+    constexpr const wchar_t* kInputTicketProperty = L"YMM4.AMF.InputTicket";
+
+    // Like MF's IMFTrackedSample callback, this observer tracks input-resource
+    // consumption, not bitstream delivery. It never captures EncoderState and
+    // retains the external texture and bookkeeping across late teardown callbacks.
+    class InputLeaseObserver final : public amf::AMFSurfaceObserver
+    {
+        std::shared_ptr<AmfInputRecyclePool> pool;
+        std::shared_ptr<AmfInputWaitSignal> inputWaitSignal;
+        ID3D11Texture2D* texture;
+        uint64_t ticket;
+    public:
+        InputLeaseObserver(std::shared_ptr<AmfInputRecyclePool> owner,
+            std::shared_ptr<AmfInputWaitSignal> waitSignal, ID3D11Texture2D* input, uint64_t id)
+            : pool(std::move(owner)), inputWaitSignal(std::move(waitSignal)), texture(input), ticket(id)
+        { texture->AddRef(); }
+        void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface* surface) override
+        {
+            surface->RemoveObserver(this);
+            if (pool->ReleaseInput(ticket) && inputWaitSignal) inputWaitSignal->NotifyInputRelease();
+            texture->Release();
+            delete this;
+        }
+    };
 
     bool SetEncoderProperties(EncoderState* state, int bitrateKbps, int quality, int rateControlMode, int maxBitrateKbps)
     {
@@ -3173,6 +3250,26 @@ namespace
 
     void ReleaseOutputSlot(EncoderState* state, amf::AMFData* data)
     {
+        if (state->inputRecyclePool)
+        {
+            amf_int64 ticket = 0;
+            uint64_t residence = 0;
+            if (data->GetProperty(kInputTicketProperty, &ticket) != AMF_OK || ticket <= 0
+                || !state->inputRecyclePool->CompleteOutput(static_cast<uint64_t>(ticket), residence))
+            {
+                SetError(state, L"AMF output did not preserve a valid input-recycling ticket.");
+                state->outputError = true;
+                return;
+            }
+            if (state->profile.enabled.load(std::memory_order_relaxed))
+            {
+                state->profile.metrics[AmfProfileStage::SlotResidence].Add(residence);
+                state->profile.completed.fetch_add(1, std::memory_order_relaxed);
+            }
+            ++state->completedFrames;
+            if (state->inputWaitSignal) state->inputWaitSignal->NotifyOutput();
+            return; // An old output must never free a newer lease of this texture.
+        }
         amf_int64 slotIndex = -1;
         AMF_RESULT propertyResult = data->GetProperty(kSlotIndexProperty, &slotIndex);
         if (propertyResult != AMF_OK || slotIndex < 0 || static_cast<size_t>(slotIndex) >= state->slots.size())
@@ -3191,9 +3288,14 @@ namespace
                 state->profile.completed.fetch_add(1, std::memory_order_relaxed);
                 slot->profileStart = 0;
             }
-            slot->inFlight = false;
+            if (slot->returnGate.MarkOutputReceived())
+            {
+                slot->inFlight = false;
+                --state->texturePoolStatus.inputsInUse;
+            }
             ++state->completedFrames;
         }
+        if (state->inputWaitSignal) state->inputWaitSignal->NotifyOutput();
         state->slotCv.notify_all();
     }
 
@@ -3207,6 +3309,9 @@ namespace
             while (!state->outputStop)
             {
                 amf::AMFDataPtr data;
+                const bool boundedWait = state->outputWait.timeoutMs != 0;
+                const auto queryStart = boundedWait ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 AmfProfileScope queryScope(state->profile, AmfProfileStage::QueryOutput);
                 AMF_RESULT result = state->encoder->QueryOutput(&data);
                 queryScope.Stop();
@@ -3216,8 +3321,22 @@ namespace
                 }
                 if (result == AMF_REPEAT || result == AMF_NEED_MORE_INPUT || (result == AMF_OK && data == nullptr))
                 {
-                    AmfProfileScope pollScope(state->profile, AmfProfileStage::OutputPollWait);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    // Some drivers return immediately despite accepting QueryTimeout.
+                    // Retain a sleep in that case to prevent an idle busy-spin, and
+                    // record it separately from an actually blocking QueryOutput.
+                    if (!boundedWait || std::chrono::steady_clock::now() - queryStart < std::chrono::milliseconds(1))
+                    {
+                        if (boundedWait) state->earlyPollWaits.fetch_add(1, std::memory_order_relaxed);
+                        AmfProfileScope pollScope(state->profile, AmfProfileStage::OutputPollWait);
+                        LARGE_INTEGER dueTime{};
+                        dueTime.QuadPart = -10000; // Relative 1 ms in 100 ns units.
+                        if (boundedWait && state->outputPollTimer
+                            && SetWaitableTimerEx(state->outputPollTimer, &dueTime, 0, nullptr, nullptr, nullptr, 0)
+                            && WaitForSingleObject(state->outputPollTimer, 50) == WAIT_OBJECT_0)
+                            state->highResolutionPollWaits.fetch_add(1, std::memory_order_relaxed);
+                        else
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
                     continue;
                 }
                 if (result != AMF_OK)
@@ -3269,6 +3388,9 @@ namespace
             }
 
             state->outputDone = true;
+            if (state->outputError && state->submitQueue) state->submitQueue->Abort();
+            if (state->inputRecyclePool) state->inputRecyclePool->Stop();
+            if (state->inputWaitSignal) state->inputWaitSignal->Stop();
             state->outputCv.notify_all();
             state->slotCv.notify_all();
             LogLine(state, L"AMF output thread exit");
@@ -3279,6 +3401,17 @@ namespace
     {
         if (!state || !state->outputThread.joinable())
         {
+            return;
+        }
+        if (state->outputWait.timeoutMs != 0)
+        {
+            // Let the finite QueryOutput call finish before touching Flush. Do
+            // not race a blocking output call with a driver's flush operation.
+            state->outputStop = true;
+            state->outputThread.join();
+            if (flush && state->encoder) state->encoder->Flush();
+            state->slotCv.notify_all();
+            state->outputCv.notify_all();
             return;
         }
         if (flush && state->encoder)
@@ -3312,13 +3445,28 @@ namespace
         if (!CheckStatus(state, init(AMF_FULL_VERSION, &state->factory), L"AMFInit failed")) return false;
         if (!CheckStatus(state, queryVersion(&state->runtimeVersion), L"AMFQueryVersion failed")) return false;
         if (!CheckStatus(state, state->factory->CreateContext(&state->context), L"AMF CreateContext failed")) return false;
-        if (!CheckStatus(state, state->context->InitDX11(device), L"AMF InitDX11 failed")) return false;
-
         state->width = width;
         state->height = height;
         state->fps = fps;
         state->codec = codec;
         state->surfaceFormat = surfaceFormat;
+        state->encoderSurfaceFormat = state->mfStyleNv12 ? amf::AMF_SURFACE_NV12 : surfaceFormat;
+        state->sourceDevice = device;
+        state->sourceDevice->AddRef();
+        if (state->dedicatedDevice)
+        {
+            D3D11_TEXTURE2D_DESC bridgeDesc{};
+            bridgeDesc.Width = width; bridgeDesc.Height = height;
+            bridgeDesc.MipLevels = bridgeDesc.ArraySize = bridgeDesc.SampleDesc.Count = 1;
+            bridgeDesc.Format = surfaceFormat == amf::AMF_SURFACE_RGBA ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+            bridgeDesc.Usage = D3D11_USAGE_DEFAULT;
+            bridgeDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            state->deviceBridge = std::make_unique<AmfDeviceBridge>();
+            std::wstring bridgeError;
+            if (!state->deviceBridge->Initialize(device, bridgeDesc, bridgeError))
+            { SetError(state, bridgeError); return false; }
+            device = state->deviceBridge->Device();
+        }
         state->device = device;
         state->device->AddRef();
         state->device->GetImmediateContext(&state->deviceContext);
@@ -3328,14 +3476,105 @@ namespace
             return false;
         }
 
+        if (state->asyncSubmission)
+        {
+            Microsoft::WRL::ComPtr<ID3D11Multithread> protection;
+            if (FAILED(state->deviceContext->QueryInterface(IID_PPV_ARGS(&protection)))
+                || !protection->GetMultithreadProtected())
+            {
+                SetError(state, L"Async submission requires an already multithread-protected host device or the dedicated-device option.");
+                return false; // Do not change the borrowed host's threading contract.
+            }
+        }
+        if (!CheckStatus(state, state->context->InitDX11(device), L"AMF InitDX11 failed")) return false;
         const wchar_t* componentId = codec == kCodecHevc ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
         if (!CheckStatus(state, state->factory->CreateComponent(state->context, componentId, &state->encoder), L"AMF encoder creation failed")) return false;
         if (!SetEncoderProperties(state, bitrateKbps, quality, rateControlMode, maxBitrateKbps)) return false;
-        if (!CheckStatus(state, state->encoder->Init(surfaceFormat, width, height), L"AMF encoder initialization failed")) return false;
+        if (state->mfStyleNv12)
+        {
+            const DXGI_FORMAT sourceDxgi = surfaceFormat == amf::AMF_SURFACE_RGBA
+                ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+            state->nv12Processor = std::make_unique<AmfNv12Processor>();
+            std::wstring processorError;
+            if (!state->nv12Processor->Initialize(state->device, static_cast<UINT>(width),
+                static_cast<UINT>(height), static_cast<UINT>(fps), sourceDxgi, processorError))
+            {
+                SetError(state, processorError);
+                return false;
+            }
 
-        const DXGI_FORMAT dxgiFormat = surfaceFormat == amf::AMF_SURFACE_RGBA
-            ? DXGI_FORMAT_R8G8B8A8_UNORM
-            : DXGI_FORMAT_B8G8R8A8_UNORM;
+            const wchar_t* inputProfile = codec == kCodecHevc
+                ? AMF_VIDEO_ENCODER_HEVC_INPUT_COLOR_PROFILE : AMF_VIDEO_ENCODER_INPUT_COLOR_PROFILE;
+            const wchar_t* inputTransfer = codec == kCodecHevc
+                ? AMF_VIDEO_ENCODER_HEVC_INPUT_TRANSFER_CHARACTERISTIC : AMF_VIDEO_ENCODER_INPUT_TRANSFER_CHARACTERISTIC;
+            const wchar_t* inputPrimaries = codec == kCodecHevc
+                ? AMF_VIDEO_ENCODER_HEVC_INPUT_COLOR_PRIMARIES : AMF_VIDEO_ENCODER_INPUT_COLOR_PRIMARIES;
+            if (!CheckStatus(state, state->encoder->SetProperty(inputProfile,
+                static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709)), L"AMF rejected the BT.709 studio input profile")) return false;
+            if (!CheckStatus(state, state->encoder->SetProperty(inputTransfer,
+                static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)), L"AMF rejected the BT.709 input transfer characteristic")) return false;
+            if (!CheckStatus(state, state->encoder->SetProperty(inputPrimaries,
+                static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)), L"AMF rejected the BT.709 input color primaries")) return false;
+        }
+        // AMF's sample applications apply QueryTimeout as a static parameter,
+        // before Init. A successful SetProperty/readback after Init is not proof
+        // that the driver's output worker has adopted the new timeout.
+        const wchar_t* timeoutProperty = codec == kCodecHevc
+            ? AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT : AMF_VIDEO_ENCODER_QUERY_TIMEOUT;
+        const wchar_t* timeoutCapability = codec == kCodecHevc
+            ? AMF_VIDEO_ENCODER_HEVC_CAP_QUERY_TIMEOUT_SUPPORT : AMF_VIDEO_ENCODER_CAP_QUERY_TIMEOUT_SUPPORT;
+        const bool waitConfigured = ConfigureAmfOutputWait(state->outputWait.requested != 0,
+            [&](bool& supported) -> int32_t
+            {
+                amf::AMFCapsPtr caps;
+                AMF_RESULT result = state->encoder->GetCaps(&caps);
+                if (result != AMF_OK) return result;
+                if (!caps) return AMF_FAIL;
+                return caps->GetProperty(timeoutCapability, &supported);
+            },
+            [&](int64_t timeout) -> int32_t { return state->encoder->SetProperty(timeoutProperty, static_cast<amf_int64>(timeout)); },
+            [&](int64_t& timeout) -> int32_t
+            {
+                amf_int64 actual = -1;
+                AMF_RESULT result = state->encoder->GetProperty(timeoutProperty, &actual);
+                timeout = actual;
+                return result;
+            }, state->outputWait);
+        const std::string waitReason = AmfOutputWaitReasonName(state->outputWait.reason);
+        LogLine(state, L"output wait requested=" + std::to_wstring(state->outputWait.requested)
+            + L" timeout_ms=" + std::to_wstring(state->outputWait.timeoutMs)
+            + L" reason=" + std::wstring(waitReason.begin(), waitReason.end())
+            + L" capability_result=" + std::to_wstring(state->outputWait.capabilityResult)
+            + L" property_result=" + std::to_wstring(state->outputWait.propertyResult));
+        if (!waitConfigured)
+        {
+            SetError(state, L"AMF output wait could not be reset safely. Disable output-wait optimization and retry.");
+            return false;
+        }
+        if (!CheckStatus(state, state->encoder->Init(state->encoderSurfaceFormat, width, height), L"AMF encoder initialization failed")) return false;
+        if (state->outputWait.timeoutMs != 0)
+        {
+            amf_int64 timeout = -1;
+            const AMF_RESULT waitReadback = state->encoder->GetProperty(timeoutProperty, &timeout);
+            if (waitReadback != AMF_OK || timeout != kAmfOutputWaitTimeoutMs)
+            {
+                state->outputWait.reason = AmfOutputWaitInitializationChanged;
+                state->outputWait.timeoutMs = 0;
+                state->outputWait.propertyResult = waitReadback;
+                SetError(state, L"AMF output-wait configuration changed during initialization. Disable output-wait optimization and retry.");
+                return false;
+            }
+            // Tested DX11 BGRA exports can return early even with a supported
+            // timeout. Avoid a busy-spin AND coarse ~15 ms sleeps.
+            // No timeBeginPeriod/global timer resolution change is made.
+            state->outputPollTimer = CreateWaitableTimerExW(nullptr, nullptr,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
+            LogLine(state, state->outputPollTimer ? L"output wait high-resolution fallback available"
+                : L"output wait high-resolution timer unavailable; early returns use legacy sleep");
+        }
+
+        const DXGI_FORMAT dxgiFormat = state->mfStyleNv12 ? DXGI_FORMAT_NV12
+            : surfaceFormat == amf::AMF_SURFACE_RGBA ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = static_cast<UINT>(width);
         desc.Height = static_cast<UINT>(height);
@@ -3344,7 +3583,8 @@ namespace
         desc.Format = dxgiFormat;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc.BindFlags = state->mfStyleNv12 ? D3D11_BIND_RENDER_TARGET
+            : D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
         state->slots.reserve(static_cast<size_t>(texturePoolSize));
         for (int i = 0; i < texturePoolSize; ++i)
@@ -3356,21 +3596,243 @@ namespace
                 SetError(state, L"Failed to create an owned AMF input texture.");
                 return false;
             }
-            if (!CheckStatus(state, state->context->CreateSurfaceFromDX11Native(slot->texture, &slot->surface, nullptr),
+            if (state->mfStyleNv12)
+            {
+                std::wstring viewError;
+                if (!state->nv12Processor->CreateOutputView(slot->texture, &slot->processorOutputView, viewError))
+                {
+                    SetError(state, viewError);
+                    return false;
+                }
+            }
+            if (!state->inputRecyclePool && !CheckStatus(state, state->context->CreateSurfaceFromDX11Native(slot->texture, &slot->surface, nullptr),
                 L"AMF failed to wrap an owned D3D11 texture")) return false;
             state->slots.push_back(std::move(slot));
         }
 
         LogLine(state, L"AMF runtime version=" + std::to_wstring(state->runtimeVersion));
         LogLine(state, L"owned texture pool=" + std::to_wstring(texturePoolSize));
-        LogLine(state, L"input path=copy_bgra_efc");
+        LogLine(state, state->mfStyleNv12 ? L"input path=mf_style_owned_rgb_copy_then_d3d11_videoprocessor_nv12"
+            : state->dedicatedDevice ? L"input path=shared_nt_keyed_mutex_2_gpu_copies_dedicated_device"
+            : L"input path=copy_bgra_efc");
+        LogLine(state, state->inputRecyclePool ? L"input recycling=amf_surface_release (MF tracked-input pattern); pending output cap=2*pool"
+            : L"input recycling=encoded_output (legacy)");
         StartOutputThread(state);
         return true;
     }
 
+    bool CopyOwnedTexture(EncoderState* state, ID3D11Texture2D* destination, ID3D11Texture2D* source)
+    {
+        if (!state->deviceBridge)
+        { state->deviceContext->CopyResource(destination, source); return true; }
+        std::wstring error;
+        if (state->deviceBridge->Copy(destination, source, error)) return true;
+        SetError(state, error);
+        return false;
+    }
+
+    bool PrepareOwnedTexture(EncoderState* state, EncoderState::FrameSlot* slot, ID3D11Texture2D* source)
+    {
+        if (!state->mfStyleNv12) return CopyOwnedTexture(state, slot->texture, source);
+        const uint64_t start = state->profile.enabled.load(std::memory_order_relaxed) ? AmfProfiler::Now() : 0;
+        std::wstring error;
+        const bool converted = state->nv12Processor
+            && state->nv12Processor->Convert(slot->processorOutputView, source, error);
+        if (start) state->mfStyleNv12Cpu.Add(AmfProfiler::Now() - start);
+        if (converted)
+        {
+            state->mfStyleNv12Conversions.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        state->mfStyleNv12Failures.fetch_add(1, std::memory_order_relaxed);
+        SetError(state, error.empty() ? L"MF-style NV12 conversion failed." : error);
+        return false;
+    }
+
+    bool SubmitPreparedInput(EncoderState* state, amf::AMFSurface* surface)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        for (;;)
+        {
+            if (state->submitStop || state->outputError || state->writerError || state->outputDone)
+            { SetError(state, L"AMF submission stopped before input completed."); return false; }
+            const uint64_t observedProgress = state->adaptiveInputWait && state->inputWaitSignal
+                ? state->inputWaitSignal->Observe() : 0;
+            AmfProfileScope submitScope(state->profile, AmfProfileStage::SubmitInput);
+            const AMF_RESULT result = state->encoder->SubmitInput(surface);
+            submitScope.Stop();
+            if (result == AMF_OK)
+            {
+                if (state->profile.enabled.load(std::memory_order_relaxed))
+                    state->profile.accepted.fetch_add(1, std::memory_order_relaxed);
+                ++state->acceptedFrames;
+                return true;
+            }
+            if (result != AMF_INPUT_FULL && result != AMF_NEED_MORE_INPUT)
+                return CheckStatus(state, result, L"AMF SubmitInput failed");
+            ++state->inputFullCount;
+            if (state->profile.enabled.load(std::memory_order_relaxed))
+                state->profile.retries.fetch_add(1, std::memory_order_relaxed);
+            if (std::chrono::steady_clock::now() >= deadline)
+            { SetError(state, L"Timed out while the AMF input queue was full."); return false; }
+            AmfProfileScope retryScope(state->profile, AmfProfileStage::InputRetryWait);
+            if (state->adaptiveInputWait && state->inputWaitSignal)
+            {
+                const auto waitResult = state->inputWaitSignal->WaitForProgress(observedProgress, deadline);
+                if (waitResult == AmfInputWaitSignal::Result::Stopped)
+                { SetError(state, L"AMF input-progress wait stopped before submission completed."); return false; }
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+
+    void CancelPreparedInput(EncoderState* state, EncoderState::PreparedInput& input)
+    {
+        if (state->inputRecyclePool) state->inputRecyclePool->Cancel(input.ticket, true);
+        else
+        {
+            std::lock_guard<std::mutex> lock(state->slotMutex);
+            auto& slot = state->slots[input.slot];
+            if (slot->inFlight) { slot->inFlight = false; --state->texturePoolStatus.inputsInUse; }
+            slot->profileStart = 0;
+        }
+        input.surface = nullptr; // Recycled inputs return via observer, not a second manual release.
+        state->slotCv.notify_all();
+    }
+
+    void MarkSubmissionReturned(EncoderState* state, size_t index)
+    {
+        if (state->inputRecyclePool) return; // Fresh surface/ticket per input, observer owns texture return.
+        {
+            std::lock_guard<std::mutex> lock(state->slotMutex);
+            auto& slot = state->slots[index];
+            if (slot->returnGate.MarkSubmitReturned())
+            {
+                slot->inFlight = false;
+                --state->texturePoolStatus.inputsInUse;
+            }
+        }
+        state->slotCv.notify_all();
+    }
+
+    void StartSubmissionThread(EncoderState* state)
+    {
+        if (!state->submitQueue) return;
+        state->submitThread = std::thread([state]()
+        {
+            const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            LogLine(state, L"AMF submission thread start; bounded by existing owned texture pool");
+            for (;;)
+            {
+                EncoderState::PreparedInput input;
+                if (!state->submitQueue->Pop(input)) break;
+                if (input.queueStart) state->queueResidence.Add(AmfProfiler::Now() - input.queueStart);
+                bool success = false;
+                try { success = SubmitPreparedInput(state, input.surface); }
+                catch (...) { SetError(state, L"AMF submission worker raised an exception."); }
+                if (!success)
+                {
+                    CancelPreparedInput(state, input);
+                    state->submitStop = true;
+                    state->outputError = true;
+                    state->submitQueue->Abort();
+                    if (state->inputRecyclePool) state->inputRecyclePool->Stop();
+                    if (state->inputWaitSignal) state->inputWaitSignal->Stop();
+                    state->slotCv.notify_all();
+                    break;
+                }
+                MarkSubmissionReturned(state, input.slot);
+                // Release our local surface before waiting for the next job.
+            }
+            auto abandoned = state->submitQueue->TakeAborted();
+            for (auto& input : abandoned) CancelPreparedInput(state, input);
+            if (SUCCEEDED(com)) CoUninitialize();
+            LogLine(state, L"AMF submission thread exit");
+        });
+    }
+
+    void StopSubmissionThread(EncoderState* state, bool cancel)
+    {
+        if (!state->submitQueue) return;
+        if (cancel) { state->submitStop = true; state->submitQueue->Abort(); }
+        else state->submitQueue->Close();
+        if (state->submitThread.joinable()) state->submitThread.join();
+        auto abandoned = state->submitQueue->TakeAborted();
+        for (auto& input : abandoned) CancelPreparedInput(state, input);
+    }
+
+    bool QueueOrSubmit(EncoderState* state, amf::AMFSurface* surface, size_t slot, uint64_t ticket)
+    {
+        if (state->submitQueue)
+        {
+            EncoderState::PreparedInput input{ surface, slot, ticket,
+                state->profile.enabled.load(std::memory_order_relaxed) ? AmfProfiler::Now() : 0 };
+            if (!state->submitQueue->Push(input, std::chrono::seconds(30)))
+            { SetError(state, L"AMF submission queue closed, stopped, or timed out."); return false; }
+            ++state->queuedFrames;
+        }
+        else
+        {
+            if (!SubmitPreparedInput(state, surface)) return false;
+            MarkSubmissionReturned(state, slot);
+        }
+        ++state->frameIndex; // Producer sequence; worker's accepted count is deliberately separate.
+        return true;
+    }
+
+    bool EncodeRecycledTexture(EncoderState* state, ID3D11Texture2D* texture)
+    {
+        AmfProfileScope waitScope(state->profile, AmfProfileStage::SlotWait);
+        const auto lease = state->inputRecyclePool->Rent(std::chrono::seconds(30));
+        waitScope.Stop();
+        if (!lease)
+        {
+            SetError(state, L"AMF input-recycling pool stopped or timed out waiting for an input/output budget.");
+            return false;
+        }
+        auto* ownedSlot = state->slots[lease.slot].get();
+        auto* ownedTexture = ownedSlot->texture;
+        AmfProfileScope copyScope(state->profile, AmfProfileStage::CopyResourceCpu);
+        if (!PrepareOwnedTexture(state, ownedSlot, texture))
+        { state->inputRecyclePool->Cancel(lease.ticket, false); return false; }
+        copyScope.Stop();
+        // The texture is pooled; this short-lived surface transfers the reference
+        // lifetime to AMF, as MF does with a fresh tracked sample per input frame.
+        amf::AMFSurfacePtr surface;
+        if (!CheckStatus(state, state->context->CreateSurfaceFromDX11Native(ownedTexture, &surface, nullptr),
+            L"AMF failed to wrap a recycled input texture"))
+        {
+            state->inputRecyclePool->Cancel(lease.ticket, false);
+            return false;
+        }
+        auto* observer = new (std::nothrow) InputLeaseObserver(state->inputRecyclePool,
+            state->adaptiveInputWait ? state->inputWaitSignal : nullptr, ownedTexture, lease.ticket);
+        if (!observer)
+        {
+            state->inputRecyclePool->Cancel(lease.ticket, false);
+            SetError(state, L"Could not allocate an AMF input-release observer.");
+            return false;
+        }
+        surface->AddObserver(observer);
+        surface->SetPts(static_cast<amf_pts>((state->frameIndex * AMF_SECOND) / static_cast<uint64_t>(state->fps)));
+        surface->SetDuration(static_cast<amf_pts>(AMF_SECOND / state->fps));
+        if (!CheckStatus(state, surface->SetProperty(kInputTicketProperty, static_cast<amf_int64>(lease.ticket)),
+            L"Failed to attach AMF input-recycling ticket"))
+        {
+            state->inputRecyclePool->Cancel(lease.ticket, true);
+            return false;
+        }
+        if (QueueOrSubmit(state, surface, lease.slot, lease.ticket)) return true;
+        state->inputRecyclePool->Cancel(lease.ticket, true);
+        return false;
+    }
+
     bool EncodeTexture(EncoderState* state, ID3D11Texture2D* texture)
     {
-        if (!state || !texture || !state->encoder || state->drainRequested || state->outputError)
+        if (!state || !texture || !state->encoder || state->drainRequested || state->outputError || state->submitStop)
         {
             return false;
         }
@@ -3380,7 +3842,8 @@ namespace
         const DXGI_FORMAT expectedFormat = state->surfaceFormat == amf::AMF_SURFACE_RGBA
             ? DXGI_FORMAT_R8G8B8A8_UNORM
             : DXGI_FORMAT_B8G8R8A8_UNORM;
-        if (sourceDesc.Width != static_cast<UINT>(state->width)
+        if (sourceDesc.MipLevels != 1 || sourceDesc.ArraySize != 1 || sourceDesc.SampleDesc.Count != 1
+            || sourceDesc.Width != static_cast<UINT>(state->width)
             || sourceDesc.Height != static_cast<UINT>(state->height)
             || (sourceDesc.Format != expectedFormat
                 && sourceDesc.Format != (expectedFormat == DXGI_FORMAT_B8G8R8A8_UNORM
@@ -3391,10 +3854,21 @@ namespace
             return false;
         }
 
+        if (state->asyncSubmission || state->dedicatedDevice || state->mfStyleNv12)
+        {
+            Microsoft::WRL::ComPtr<ID3D11Device> actual;
+            texture->GetDevice(&actual);
+            if (actual.Get() != state->sourceDevice)
+            { SetError(state, L"Input D3D11 device changed during export."); return false; }
+        }
+        if (state->inputRecyclePool) return EncodeRecycledTexture(state, texture);
+
         size_t slotIndex = 0;
         {
             AmfProfileScope slotWaitScope(state->profile, AmfProfileStage::SlotWait);
             std::unique_lock<std::mutex> lock(state->slotMutex);
+            if (state->texturePoolStatus.inputsInUse == state->slots.size())
+                ++state->texturePoolStatus.inputExhaustionCount;
             const bool ready = state->slotCv.wait_for(lock, std::chrono::seconds(30), [state]()
             {
                 if (state->outputError || state->outputDone) return true;
@@ -3414,6 +3888,10 @@ namespace
                 {
                     slotIndex = candidate;
                     state->slots[candidate]->inFlight = true;
+                    state->slots[candidate]->returnGate = {};
+                    ++state->texturePoolStatus.inputsInUse;
+                    state->texturePoolStatus.peakInputsInUse = std::max(state->texturePoolStatus.peakInputsInUse,
+                        state->texturePoolStatus.inputsInUse);
                     state->slots[candidate]->frameId = state->frameIndex;
                     if (state->profile.enabled.load(std::memory_order_relaxed))
                         state->slots[candidate]->profileStart = AmfProfiler::Now();
@@ -3431,7 +3909,12 @@ namespace
 
         auto& slot = state->slots[slotIndex];
         AmfProfileScope copyScope(state->profile, AmfProfileStage::CopyResourceCpu);
-        state->deviceContext->CopyResource(slot->texture, texture);
+        if (!PrepareOwnedTexture(state, slot.get(), texture))
+        {
+            EncoderState::PreparedInput cancelled{ nullptr, slotIndex, 0, 0 };
+            CancelPreparedInput(state, cancelled);
+            return false;
+        }
         copyScope.Stop();
         const amf_pts pts = static_cast<amf_pts>((state->frameIndex * AMF_SECOND) / static_cast<uint64_t>(state->fps));
         const amf_pts duration = static_cast<amf_pts>(AMF_SECOND / state->fps);
@@ -3442,44 +3925,17 @@ namespace
         {
             std::lock_guard<std::mutex> lock(state->slotMutex);
             slot->inFlight = false;
+            --state->texturePoolStatus.inputsInUse;
             state->slotCv.notify_all();
             return false;
         }
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        for (;;)
-        {
-            AmfProfileScope submitScope(state->profile, AmfProfileStage::SubmitInput);
-            AMF_RESULT result = state->encoder->SubmitInput(slot->surface);
-            submitScope.Stop();
-            if (result == AMF_OK)
-            {
-                if (state->profile.enabled.load(std::memory_order_relaxed))
-                    state->profile.accepted.fetch_add(1, std::memory_order_relaxed);
-                ++state->acceptedFrames;
-                ++state->frameIndex;
-                return true;
-            }
-            if (result != AMF_INPUT_FULL && result != AMF_NEED_MORE_INPUT)
-            {
-                CheckStatus(state, result, L"AMF SubmitInput failed");
-                break;
-            }
-            ++state->inputFullCount;
-            if (state->profile.enabled.load(std::memory_order_relaxed))
-                state->profile.retries.fetch_add(1, std::memory_order_relaxed);
-            if (state->outputError || std::chrono::steady_clock::now() >= deadline)
-            {
-                SetError(state, L"Timed out while the AMF input queue was full.");
-                break;
-            }
-            AmfProfileScope retryScope(state->profile, AmfProfileStage::InputRetryWait);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        if (QueueOrSubmit(state, slot->surface, slotIndex, 0)) return true;
 
         {
             std::lock_guard<std::mutex> lock(state->slotMutex);
             slot->inFlight = false;
+            --state->texturePoolStatus.inputsInUse;
         }
         state->slotCv.notify_all();
         return false;
@@ -3855,12 +4311,36 @@ void* AmfCreate(ID3D11Device* device, int width, int height, int fps, int bitrat
     int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize, int enableDebugLog,
     const wchar_t* outputPath)
 {
+    return AmfCreateWithOutputWait(device, width, height, fps, bitrateKbps, codec, quality,
+        rateControlMode, maxBitrateKbps, surfaceFormat, texturePoolSize, enableDebugLog, outputPath, 0);
+}
+
+static void* CreateAmfEncoder(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality,
+    int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize, int enableDebugLog,
+    const wchar_t* outputPath, int optimizeOutputWait, bool recycleInput,
+    bool asyncSubmission = false, bool dedicatedDevice = false, bool adaptiveInputWait = false,
+    bool mfStyleNv12 = false)
+{
     if (!device || !outputPath || width <= 0 || height <= 0 || fps <= 0)
     {
         return nullptr;
     }
 
     auto* state = new EncoderState();
+    state->asyncSubmission = asyncSubmission;
+    state->dedicatedDevice = dedicatedDevice;
+    state->adaptiveInputWait = adaptiveInputWait;
+    state->mfStyleNv12 = mfStyleNv12;
+    state->mfStyleNv12Status.version = 1;
+    state->mfStyleNv12Status.requested = mfStyleNv12 ? 1u : 0u;
+    state->mfStyleNv12Status.active = mfStyleNv12 ? 1u : 0u;
+    state->mfStyleNv12Status.sourceDxgiFormat = surfaceFormat == amf::AMF_SURFACE_RGBA
+        ? static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM) : static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+    state->mfStyleNv12Status.encoderSurfaceFormat = mfStyleNv12
+        ? static_cast<uint32_t>(amf::AMF_SURFACE_NV12) : static_cast<uint32_t>(surfaceFormat);
+    state->mfStyleNv12Status.gpuOperationsPerFrame = mfStyleNv12 ? 2u : 0u;
+    state->inputWaitSignal = std::make_shared<AmfInputWaitSignal>(adaptiveInputWait);
+    state->outputWait.requested = optimizeOutputWait != 0 ? 1u : 0u;
     state->outputPath = outputPath;
     state->logEnabled = enableDebugLog != 0;
     OpenLog(state);
@@ -3876,7 +4356,32 @@ void* AmfCreate(ID3D11Device* device, int width, int height, int fps, int bitrat
         SetError(state, L"Only BGRA and RGBA D3D11 input textures are supported.");
         return state;
     }
-    texturePoolSize = ClampInt(texturePoolSize, 4, 8);
+    if (mfStyleNv12 && dedicatedDevice)
+    {
+        SetError(state, L"MF-style NV12 conversion cannot be combined with the dedicated encoder device experiment yet.");
+        return state;
+    }
+    const int requestedPoolSize = ClampInt(texturePoolSize, AmfTexturePoolPolicy::Minimum, AmfTexturePoolPolicy::Maximum);
+    texturePoolSize = AmfTexturePoolPolicy::Resolve(requestedPoolSize, width, height);
+    auto& poolStatus = state->texturePoolStatus;
+    poolStatus.version = 1;
+    poolStatus.requestedSize = requestedPoolSize;
+    poolStatus.effectiveSize = texturePoolSize;
+    poolStatus.pendingOutputLimit = recycleInput ? texturePoolSize * 2 : texturePoolSize;
+    const uint64_t pixels = static_cast<uint64_t>(width) * height;
+    poolStatus.nominalBytes = mfStyleNv12
+        ? pixels * 4 + pixels * 3 / 2 * texturePoolSize
+        : pixels * 4 * texturePoolSize;
+    poolStatus.expandedPayloadLimitBytes = AmfTexturePoolPolicy::ExpandedPayloadLimit;
+    LogLine(state, L"texture pool requested=" + std::to_wstring(requestedPoolSize)
+        + L" effective=" + std::to_wstring(texturePoolSize)
+        + (mfStyleNv12 ? L" nominal RGB-staging/NV12 bytes=" : L" nominal BGRA/RGBA bytes=")
+        + std::to_wstring(poolStatus.nominalBytes)
+        + L" (not total VRAM)");
+    if (recycleInput)
+        state->inputRecyclePool = std::make_shared<AmfInputRecyclePool>(texturePoolSize, texturePoolSize * 2);
+    if (asyncSubmission)
+        state->submitQueue = std::make_unique<AmfSubmissionQueue<EncoderState::PreparedInput>>(texturePoolSize);
 
     if (!InitializeAmfEncoder(state, device, width, height, fps, bitrateKbps, codec, quality,
         rateControlMode, maxBitrateKbps, static_cast<amf::AMF_SURFACE_FORMAT>(surfaceFormat), texturePoolSize))
@@ -3890,8 +4395,59 @@ void* AmfCreate(ID3D11Device* device, int width, int height, int fps, int bitrat
         return state;
     }
 
-    LogLine(state, L"AMF encoder initialized");
+    try { StartSubmissionThread(state); }
+    catch (...) { SetError(state, L"Could not start the AMF submission worker."); return state; }
+    state->pipelineInitialized = true;
+    LogLine(state, L"AMF encoder initialized; async_submission=" + std::to_wstring(asyncSubmission)
+        + L" dedicated_device=" + std::to_wstring(dedicatedDevice)
+        + L" adaptive_input_wait=" + std::to_wstring(adaptiveInputWait));
     return state;
+}
+
+void* AmfCreateWithOutputWait(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality,
+    int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize, int enableDebugLog,
+    const wchar_t* outputPath, int optimizeOutputWait)
+{
+    return CreateAmfEncoder(device, width, height, fps, bitrateKbps, codec, quality, rateControlMode,
+        maxBitrateKbps, surfaceFormat, texturePoolSize, enableDebugLog, outputPath, optimizeOutputWait, false);
+}
+
+void* AmfCreateWithInputRecycling(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality,
+    int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize, int enableDebugLog,
+    const wchar_t* outputPath, int optimizeOutputWait)
+{
+    return CreateAmfEncoder(device, width, height, fps, bitrateKbps, codec, quality, rateControlMode,
+        maxBitrateKbps, surfaceFormat, texturePoolSize, enableDebugLog, outputPath, optimizeOutputWait, true);
+}
+
+void* AmfCreateWithPipeline(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality,
+    int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize, int enableDebugLog,
+    const wchar_t* outputPath, int optimizeOutputWait, int recycleInput, int asyncSubmission, int dedicatedDevice)
+{
+    return CreateAmfEncoder(device, width, height, fps, bitrateKbps, codec, quality, rateControlMode,
+        maxBitrateKbps, surfaceFormat, texturePoolSize, enableDebugLog, outputPath, optimizeOutputWait,
+        recycleInput != 0, asyncSubmission != 0, dedicatedDevice != 0);
+}
+
+void* AmfCreateWithAdaptiveInputWait(ID3D11Device* device, int width, int height, int fps, int bitrateKbps,
+    int codec, int quality, int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize,
+    int enableDebugLog, const wchar_t* outputPath, int optimizeOutputWait, int recycleInput,
+    int asyncSubmission, int dedicatedDevice, int adaptiveInputWait)
+{
+    return CreateAmfEncoder(device, width, height, fps, bitrateKbps, codec, quality, rateControlMode,
+        maxBitrateKbps, surfaceFormat, texturePoolSize, enableDebugLog, outputPath, optimizeOutputWait,
+        recycleInput != 0, asyncSubmission != 0, dedicatedDevice != 0, adaptiveInputWait != 0);
+}
+
+void* AmfCreateWithMfStyleNv12(ID3D11Device* device, int width, int height, int fps, int bitrateKbps,
+    int codec, int quality, int rateControlMode, int maxBitrateKbps, int surfaceFormat, int texturePoolSize,
+    int enableDebugLog, const wchar_t* outputPath, int optimizeOutputWait, int recycleInput,
+    int asyncSubmission, int dedicatedDevice, int adaptiveInputWait, int mfStyleNv12)
+{
+    return CreateAmfEncoder(device, width, height, fps, bitrateKbps, codec, quality, rateControlMode,
+        maxBitrateKbps, surfaceFormat, texturePoolSize, enableDebugLog, outputPath, optimizeOutputWait,
+        recycleInput != 0, asyncSubmission != 0, dedicatedDevice != 0, adaptiveInputWait != 0,
+        mfStyleNv12 != 0);
 }
 
 int AmfEncode(void* handle, ID3D11Texture2D* texture)
@@ -3953,10 +4509,14 @@ int AmfFinalize(void* handle)
     AmfProfileScope finalizeScope(state->profile, AmfProfileStage::Finalize);
     if (state->mp4Finalized)
     {
-        return state->lastError.empty() ? 1 : 0;
+        return HasError(state) ? 0 : 1;
     }
 
     state->drainRequested = true;
+    // First stop accepting new inputs and submit every queued owned input. Only
+    // then may Drain produce EOF; reversing these steps truncates async exports.
+    StopSubmissionThread(state, false);
+    if (state->outputError || state->submitStop || HasError(state)) return 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     for (;;)
     {
@@ -3989,10 +4549,23 @@ int AmfFinalize(void* handle)
     {
         return 0;
     }
-    if (state->acceptedFrames != state->completedFrames)
+    if (state->acceptedFrames != state->completedFrames || state->acceptedFrames != state->frameIndex)
     {
         SetError(state, L"AMF completed-frame count does not match accepted input count.");
         return 0;
+    }
+    if (state->inputRecyclePool)
+    {
+        const auto recycled = state->inputRecyclePool->Snapshot();
+        if (recycled.invalidEvents || recycled.pendingOutputs)
+        {
+            SetError(state, L"AMF input-recycling lifecycle validation failed.");
+            return 0;
+        }
+        LogLine(state, L"MF-style input recycling: input_releases=" + std::to_wstring(recycled.inputReleases)
+            + L" before_output=" + std::to_wstring(recycled.inputReleasesBeforeOutput)
+            + L" reuses_before_output=" + std::to_wstring(recycled.reusesBeforeOutput)
+            + L" peak_pending=" + std::to_wstring(recycled.peakPendingOutputs));
     }
 
     std::lock_guard<std::mutex> muxLock(state->muxMutex);
@@ -4014,7 +4587,15 @@ void AmfDestroy(void* handle)
     }
 
     LogLine(state, L"destroy AMF encoder");
+    if (state->inputWaitSignal) state->inputWaitSignal->Stop();
+    if (state->inputRecyclePool) state->inputRecyclePool->Stop();
+    StopSubmissionThread(state, true); // No SubmitInput/AMF surface may race Flush/Terminate.
     StopOutputThread(state, true);
+    if (state->outputPollTimer)
+    {
+        CloseHandle(state->outputPollTimer);
+        state->outputPollTimer = nullptr;
+    }
     if (!state->mp4Finalized && state->writerInitialized)
     {
         std::lock_guard<std::mutex> muxLock(state->muxMutex);
@@ -4027,12 +4608,14 @@ void AmfDestroy(void* handle)
         state->encoder = nullptr;
     }
     state->slots.clear();
+    state->nv12Processor.reset();
     if (state->context)
     {
         state->context->Terminate();
         state->context = nullptr;
     }
     state->factory = nullptr;
+    if (state->deviceBridge) state->deviceBridge->ReleaseResources();
 
     if (state->aacEncoder)
     {
@@ -4059,6 +4642,8 @@ void AmfDestroy(void* handle)
         state->device->Release();
         state->device = nullptr;
     }
+    state->deviceBridge.reset();
+    if (state->sourceDevice) { state->sourceDevice->Release(); state->sourceDevice = nullptr; }
     if (state->amfModule)
     {
         FreeLibrary(state->amfModule);
@@ -4074,7 +4659,49 @@ void AmfDestroy(void* handle)
 const wchar_t* AmfGetLastError(void* handle)
 {
     auto* state = reinterpret_cast<EncoderState*>(handle);
-    return state ? state->lastError.c_str() : L"";
+    // Snapshot rather than returning a string concurrently modified by workers.
+    thread_local std::wstring snapshot;
+    if (!state) return L"";
+    std::lock_guard<std::mutex> lock(state->errorMutex);
+    snapshot = state->lastError;
+    return snapshot.c_str();
+}
+
+int AmfGetPipelineStatus(void* handle, AmfPipelineStatus* result, uint32_t resultSize)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(AmfPipelineStatus)) return 0;
+    *result = {};
+    result->version = 1;
+    result->asyncSubmission = state->asyncSubmission;
+    result->dedicatedDevice = state->dedicatedDevice;
+    result->initialized = state->pipelineInitialized;
+    // The MF-style route issues one CopyResource plus one VideoProcessorBlt.
+    // Keep this legacy field at 2 so pipeline reports do not undercount GPU work;
+    // the dedicated status names the operations precisely.
+    result->gpuCopiesPerFrame = state->dedicatedDevice || state->mfStyleNv12 ? 2 : 1;
+    result->queueCapacity = state->submitQueue ? state->texturePoolStatus.effectiveSize : 0;
+    if (state->submitQueue) state->submitQueue->Snapshot(result->queueDepth, result->peakQueueDepth);
+    result->queuedFrames = state->queuedFrames.load();
+    result->submittedFrames = state->acceptedFrames.load();
+    if (state->deviceBridge)
+    {
+        result->extraSharedTextureBytes = state->deviceBridge->nominalBytes;
+        result->adapterLuid = state->deviceBridge->adapterLuid;
+    }
+    result->queueResidence = { state->queueResidence.count.load(), state->queueResidence.total.load(),
+        state->queueResidence.maximum.load() };
+    return 1;
+}
+
+static_assert(sizeof(AmfPipelineStatus) == 88, "Pipeline status ABI mismatch");
+
+int AmfGetInputWaitStatus(void* handle, AmfInputWaitStatus* result, uint32_t resultSize)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(AmfInputWaitStatus) || !state->inputWaitSignal) return 0;
+    *result = state->inputWaitSignal->Snapshot();
+    return 1;
 }
 
 int AmfEnableProfiling(void* handle)
@@ -4090,5 +4717,51 @@ int AmfGetProfile(void* handle, AmfProfileSnapshot* result, uint32_t resultSize)
     auto* state = reinterpret_cast<EncoderState*>(handle);
     if (!state || !result || resultSize != sizeof(AmfProfileSnapshot)) return 0;
     *result = state->profile.Snapshot();
+    return 1;
+}
+
+int AmfGetMfStyleNv12Status(void* handle, AmfMfStyleNv12Status* result, uint32_t resultSize)
+{
+    static_assert(sizeof(AmfMfStyleNv12Status) == 72, "MF-style NV12 status ABI mismatch");
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(AmfMfStyleNv12Status)) return 0;
+    *result = state->mfStyleNv12Status;
+    result->conversions = state->mfStyleNv12Conversions.load(std::memory_order_relaxed);
+    result->failures = state->mfStyleNv12Failures.load(std::memory_order_relaxed);
+    result->conversionCpu = {
+        state->mfStyleNv12Cpu.count.load(std::memory_order_relaxed),
+        state->mfStyleNv12Cpu.total.load(std::memory_order_relaxed),
+        state->mfStyleNv12Cpu.maximum.load(std::memory_order_relaxed),
+    };
+    return 1;
+}
+
+int AmfGetOutputWaitStatus(void* handle, AmfOutputWaitStatus* result, uint32_t resultSize)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(AmfOutputWaitStatus)) return 0;
+    *result = state->outputWait; // Configuration is immutable once the output thread starts.
+    result->highResolutionPollWaits = state->highResolutionPollWaits.load(std::memory_order_relaxed);
+    result->earlyPollWaits = state->earlyPollWaits.load(std::memory_order_relaxed);
+    return 1;
+}
+
+int AmfGetTexturePoolStatus(void* handle, AmfTexturePoolStatus* result, uint32_t resultSize)
+{
+    static_assert(sizeof(AmfTexturePoolStatus) == 64, "Texture pool status ABI mismatch");
+    auto* state = static_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize < sizeof(*result)) return 0;
+    std::lock_guard<std::mutex> lock(state->slotMutex);
+    *result = state->texturePoolStatus;
+    if (state->inputRecyclePool) state->inputRecyclePool->FillPoolStatus(*result);
+    return 1;
+}
+
+int AmfGetInputRecycleStatus(void* handle, AmfInputRecycleStatus* result, uint32_t resultSize)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(AmfInputRecycleStatus)) return 0;
+    *result = state->inputRecyclePool ? state->inputRecyclePool->Snapshot() : AmfInputRecycleStatus{};
+    result->version = 1;
     return 1;
 }

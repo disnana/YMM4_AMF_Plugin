@@ -21,6 +21,12 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
     // YMM4 queries this capability to select the bitmap delivery path. Keep the
     // choice constant for this export even if the next export's settings change.
     private readonly bool _gpuDirectInput;
+    private readonly bool _optimizeOutputWait;
+    private readonly bool _recycleInput;
+    private readonly bool _asyncSubmission;
+    private readonly bool _dedicatedDevice;
+    private readonly bool _adaptiveInputWait;
+    private readonly bool _mfStyleNv12;
 
     public AmfVideoFileWriter(string outputPath, VideoInfo videoInfo, AmfSettings settings)
     {
@@ -28,6 +34,12 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
         _videoInfo = videoInfo;
         _settings = settings;
         _gpuDirectInput = settings.EnableGpuDirectInput;
+        _optimizeOutputWait = settings.OptimizeOutputWait;
+        _recycleInput = settings.RecycleInputAfterRelease;
+        _asyncSubmission = settings.AsyncSubmission;
+        _dedicatedDevice = settings.DedicatedEncoderDevice;
+        _adaptiveInputWait = settings.AdaptiveInputWait;
+        _mfStyleNv12 = settings.MfStyleNv12;
         _audioChannels = ResolveAudioChannels(videoInfo);
         if (settings.EnableProfiling)
         {
@@ -41,8 +53,16 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
                 sample_rate = videoInfo.Hz, audio_channels = _audioChannels,
                 codec = settings.Codec.ToString(), quality = settings.Quality.ToString(),
                 rate_control = settings.RateControl.ToString(), target_bitrate_kbps = GetTargetBitrateKbps(),
-                pool_size = settings.TexturePoolSize, debug_log_enabled = settings.EnableDebugLog,
+                requested_pool_size = settings.TexturePoolSize,
+                pool_size = TexturePoolPolicy.Resolve(settings.TexturePoolSize, videoInfo.Width, videoInfo.Height),
+                debug_log_enabled = settings.EnableDebugLog,
                 gpu_direct_input_enabled = _gpuDirectInput,
+                optimize_output_wait = _optimizeOutputWait,
+                recycle_input_after_release = _recycleInput,
+                async_submission = _asyncSubmission,
+                dedicated_encoder_device = _dedicatedDevice,
+                adaptive_input_wait = _adaptiveInputWait,
+                mf_style_nv12 = _mfStyleNv12,
             });
         }
     }
@@ -169,6 +189,12 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
     private void CaptureNativeProfile()
     {
         if (_profile is null || _encoderHandle == IntPtr.Zero) return;
+        CaptureOutputWaitStatus();
+        CaptureInputRecycleStatus();
+        CaptureTexturePoolStatus();
+        CapturePipelineStatus();
+        CaptureInputWaitStatus();
+        CaptureMfStyleNv12Status();
         try
         {
             if (AmfNativeMethods.AmfGetProfile(_encoderHandle, out var snapshot, (uint)Marshal.SizeOf<NativeProfileSnapshot>()) == 0)
@@ -180,6 +206,118 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
         {
             // Diagnostics must not prevent native cleanup or hide the original error.
             _profile.NativeStatus = "unavailable: " + exception.Message;
+        }
+    }
+
+    private void CaptureOutputWaitStatus()
+    {
+        if (_profile is null || _encoderHandle == IntPtr.Zero) return;
+        try
+        {
+            if (AmfNativeMethods.AmfGetOutputWaitStatus(_encoderHandle, out var status, (uint)Marshal.SizeOf<NativeOutputWaitStatus>()) == 0)
+                throw new InvalidOperationException("Native output-wait status unavailable.");
+            _profile.OutputWaitReport = status.ToReport();
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            _profile.OutputWaitReport = new { status = "unavailable", reason = exception.Message };
+        }
+    }
+
+    private void CaptureInputRecycleStatus()
+    {
+        if (_profile is null || _encoderHandle == IntPtr.Zero) return;
+        try
+        {
+            if (AmfNativeMethods.AmfGetInputRecycleStatus(_encoderHandle, out var status, (uint)Marshal.SizeOf<NativeInputRecycleStatus>()) == 0)
+                throw new InvalidOperationException("Native input-recycling status unavailable.");
+            _profile.InputRecycleReport = status.ToReport();
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            _profile.InputRecycleReport = new { status = "unavailable", reason = exception.Message };
+        }
+    }
+
+    private void CaptureTexturePoolStatus(bool requireExpandedPool = false)
+    {
+        if (_encoderHandle == IntPtr.Zero || (_profile is null && !requireExpandedPool)) return;
+        try
+        {
+            if (AmfNativeMethods.AmfGetTexturePoolStatus(_encoderHandle, out var status, (uint)Marshal.SizeOf<NativeTexturePoolStatus>()) == 0)
+                throw new InvalidOperationException("Native texture-pool status unavailable.");
+            var report = status.ToReport();
+            if (status.EffectiveSize != TexturePoolPolicy.Resolve(_settings.TexturePoolSize, _videoInfo.Width, _videoInfo.Height))
+                throw new InvalidOperationException("AMFテクスチャプールの実効枚数が要求と一致しません。");
+            if (_profile is not null) _profile.TexturePoolReport = report;
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            if (requireExpandedPool)
+                throw new InvalidOperationException("テクスチャ増量には同じビルドのAMFPlugin.dllとAmfNative.dllが必要です。", exception);
+            if (_profile is not null) _profile.TexturePoolReport = new { status = "unavailable", reason = exception.Message };
+        }
+    }
+
+    private void CapturePipelineStatus(bool required = false)
+    {
+        if (_encoderHandle == IntPtr.Zero || (_profile is null && !required)) return;
+        try
+        {
+            if (AmfNativeMethods.AmfGetPipelineStatus(_encoderHandle, out var status, (uint)Marshal.SizeOf<NativePipelineStatus>()) == 0)
+                throw new InvalidOperationException("Native pipeline status unavailable.");
+            var report = status.ToReport();
+            if (status.Initialized != 1 || (status.AsyncSubmission != 0) != _asyncSubmission
+                || (status.DedicatedDevice != 0) != _dedicatedDevice)
+                throw new InvalidOperationException("AMFパイプラインの要求と実効設定が一致しません。");
+            if (_profile is not null) _profile.PipelineReport = report;
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            if (required) throw new InvalidOperationException("パイプライン実験には同じビルドのAMFPlugin.dllとAmfNative.dllが必要です。", exception);
+            if (_profile is not null) _profile.PipelineReport = new { status = "unavailable", reason = exception.Message };
+        }
+    }
+
+    private void CaptureInputWaitStatus(bool required = false)
+    {
+        if (_encoderHandle == IntPtr.Zero || (_profile is null && !required)) return;
+        try
+        {
+            if (AmfNativeMethods.AmfGetInputWaitStatus(_encoderHandle, out var status,
+                (uint)Marshal.SizeOf<NativeInputWaitStatus>()) == 0)
+                throw new InvalidOperationException("Native input-full wait status unavailable.");
+            var report = status.ToReport();
+            if ((status.Requested != 0) != _adaptiveInputWait)
+                throw new InvalidOperationException("AMF入力満杯待機の要求と実効設定が一致しません。");
+            if (_profile is not null) _profile.InputWaitReport = report;
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            if (required)
+                throw new InvalidOperationException("入力満杯待機の実験には同じビルドのAMFPlugin.dllとAmfNative.dllが必要です。", exception);
+            if (_profile is not null) _profile.InputWaitReport = new { status = "unavailable", reason = exception.Message };
+        }
+    }
+
+    private void CaptureMfStyleNv12Status(bool required = false)
+    {
+        if (_encoderHandle == IntPtr.Zero || (_profile is null && !required)) return;
+        try
+        {
+            if (AmfNativeMethods.AmfGetMfStyleNv12Status(_encoderHandle, out var status,
+                (uint)Marshal.SizeOf<NativeMfStyleNv12Status>()) == 0)
+                throw new InvalidOperationException("Native MF方式NV12状態を取得できませんでした。");
+            var report = status.ToReport();
+            if ((status.Requested != 0) != _mfStyleNv12 || (status.Active != 0) != _mfStyleNv12)
+                throw new InvalidOperationException("MF方式NV12変換の要求と実効設定が一致しません。");
+            if (_profile is not null) _profile.MfStyleNv12Report = report;
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            if (required)
+                throw new InvalidOperationException("MF方式NV12実験には同じビルドのAMFPlugin.dllとAmfNative.dllが必要です。", exception);
+            if (_profile is not null) _profile.MfStyleNv12Report = new { status = "unavailable", reason = exception.Message };
         }
     }
 
@@ -213,21 +351,48 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
             ? Math.Clamp((int)(bitrate * 1.2), 100, 300000)
             : bitrate;
         var surfaceFormat = ResolveSurfaceFormat(texture);
+        var requestedPoolSize = Math.Clamp(_settings.TexturePoolSize, TexturePoolPolicy.Minimum, TexturePoolPolicy.Maximum);
 
-        _encoderHandle = AmfNativeMethods.AmfCreate(
-            device.NativePointer,
-            _videoInfo.Width,
-            _videoInfo.Height,
-            fps,
-            bitrate,
-            codec,
-            quality,
-            rateControl,
-            maxBitrate,
-            surfaceFormat,
-            Math.Clamp(_settings.TexturePoolSize, 4, 8),
-            _settings.EnableDebugLog ? 1 : 0,
-            _outputPath);
+        try
+        {
+            _encoderHandle = _mfStyleNv12
+                ? AmfNativeMethods.AmfCreateWithMfStyleNv12(device.NativePointer,
+                    _videoInfo.Width, _videoInfo.Height, fps, bitrate, codec, quality,
+                    rateControl, maxBitrate, surfaceFormat, requestedPoolSize,
+                    _settings.EnableDebugLog ? 1 : 0, _outputPath, _optimizeOutputWait ? 1 : 0,
+                    _recycleInput ? 1 : 0, _asyncSubmission ? 1 : 0, _dedicatedDevice ? 1 : 0,
+                    _adaptiveInputWait ? 1 : 0, 1)
+                : _adaptiveInputWait
+                ? AmfNativeMethods.AmfCreateWithAdaptiveInputWait(device.NativePointer,
+                    _videoInfo.Width, _videoInfo.Height, fps, bitrate, codec, quality,
+                    rateControl, maxBitrate, surfaceFormat, requestedPoolSize,
+                    _settings.EnableDebugLog ? 1 : 0, _outputPath, _optimizeOutputWait ? 1 : 0,
+                    _recycleInput ? 1 : 0, _asyncSubmission ? 1 : 0, _dedicatedDevice ? 1 : 0, 1)
+                : _asyncSubmission || _dedicatedDevice
+                ? AmfNativeMethods.AmfCreateWithPipeline(device.NativePointer,
+                    _videoInfo.Width, _videoInfo.Height, fps, bitrate, codec, quality,
+                    rateControl, maxBitrate, surfaceFormat, requestedPoolSize,
+                    _settings.EnableDebugLog ? 1 : 0, _outputPath, _optimizeOutputWait ? 1 : 0,
+                    _recycleInput ? 1 : 0, _asyncSubmission ? 1 : 0, _dedicatedDevice ? 1 : 0)
+                : _recycleInput
+                ? AmfNativeMethods.AmfCreateWithInputRecycling(device.NativePointer,
+                    _videoInfo.Width, _videoInfo.Height, fps, bitrate, codec, quality,
+                    rateControl, maxBitrate, surfaceFormat, requestedPoolSize,
+                    _settings.EnableDebugLog ? 1 : 0, _outputPath, _optimizeOutputWait ? 1 : 0)
+                : _optimizeOutputWait
+                ? AmfNativeMethods.AmfCreateWithOutputWait(device.NativePointer,
+                    _videoInfo.Width, _videoInfo.Height, fps, bitrate, codec, quality,
+                    rateControl, maxBitrate, surfaceFormat, requestedPoolSize,
+                    _settings.EnableDebugLog ? 1 : 0, _outputPath, 1)
+                : AmfNativeMethods.AmfCreate(device.NativePointer,
+                    _videoInfo.Width, _videoInfo.Height, fps, bitrate, codec, quality,
+                    rateControl, maxBitrate, surfaceFormat, requestedPoolSize,
+                    _settings.EnableDebugLog ? 1 : 0, _outputPath);
+        }
+        catch (EntryPointNotFoundException exception)
+        {
+            throw new InvalidOperationException("AmfNative.dllが古いため実験機能を利用できません。AMFPlugin.dllと同じビルドのDLLを配置してください。", exception);
+        }
 
         if (_encoderHandle == IntPtr.Zero)
         {
@@ -235,11 +400,28 @@ internal sealed class AmfVideoFileWriter : IVideoFileWriter3, IDisposable
         }
 
         var error = GetNativeError();
+        CaptureOutputWaitStatus();
+        CaptureInputRecycleStatus();
         if (!string.IsNullOrWhiteSpace(error))
         {
             AmfNativeMethods.AmfDestroy(_encoderHandle);
             _encoderHandle = IntPtr.Zero;
             throw new InvalidOperationException(error);
+        }
+
+        try
+        {
+            CaptureTexturePoolStatus(requireExpandedPool: requestedPoolSize > TexturePoolPolicy.LegacyMaximum);
+            CapturePipelineStatus(required: _asyncSubmission || _dedicatedDevice);
+            CaptureInputWaitStatus(required: _adaptiveInputWait);
+            CaptureMfStyleNv12Status(required: _mfStyleNv12);
+        }
+        catch
+        {
+            // No input submitted yet. Preserve this failure, not a later missing-header error.
+            AmfNativeMethods.AmfDestroy(_encoderHandle);
+            _encoderHandle = IntPtr.Zero;
+            throw;
         }
 
         if (_profile is not null)

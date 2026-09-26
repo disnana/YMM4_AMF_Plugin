@@ -1,5 +1,7 @@
 # 破棄モードとプロファイリング
 
+開発版の[投入スレッド・専用デバイス実験](pipeline-experiments.md)では `pipeline` セクションに要求の適用結果、GPUコピー数、未投入キュー深度、投入数、追加共有テクスチャ画素量を記録します。`submitted_video_frames` はプラグインが受け付けた数で、非同期モードではまだAMFに投入されていないフレームを含み得ます。AMFへの受理・出力完了は `native.accepted_frames` / `native.completed_frames` を確認してください。`queue_residence_cpu` はキュー投入からworker取り出しまでのCPU wall-timeで、AMF内部のencode時間ではありません。
+
 目的は、最適化を加える前に「YMM4からフレームが届くまで」と「プラグイン内の待ち・処理」を切り分けることです。通常出力のアルゴリズムや画質設定を変える機能ではありません。両オプションは既定でオフです。
 
 診断機能はv0.2.0で追加しました。開発時の自動テストと計測負荷の結果は[検証記録](benchmarks/2026-09-16-profiling.md)を参照してください。v0.1.1には含まれません。
@@ -33,7 +35,7 @@ GPU ON/OFF × 通常/破棄を別々の新規出力名で比較してくださ�
 - プロファイル（`.amf_profile.json`）：回数・合計・平均・最大時間の集計。フレームごとの一覧を保持せず、終了時にまとめて書き出します。同名JSONは置き換えます。
 - 破棄モード：AMF、D3Dテクスチャの取得・コピー、AAC、MP4処理を実行しません。デバッグログも生成しません。プロファイリングは別のチェックで有効にできます。
 
-プロファイリングの計測中にGPU待機や`Flush`を追加していません。プロファイリングがオフなら時計の読み取り・集計・JSON出力を行いませんが、オプション分岐等の追加負荷が完全にゼロとは保証しません。
+プロファイリングの計測中にGPU待機や`Flush`を追加していません。プロファイリングがオフならstageの時間集計・JSON出力を行いません。ただし、実験オプションをONにした場合の待機制御や入力寿命の診断用カウンター・時計読み取りは別に動きます。オプション分岐等も含め、追加負荷が完全にゼロとは保証しません。
 
 ## JSONの読み方
 
@@ -50,17 +52,40 @@ GPU ON/OFF × 通常/破棄を別々の新規出力名で比較してくださ�
 | `encoder_initialize` | 初回のAMF作成、所有テクスチャ作成、MP4開始、先行音声の処理。初回は定常状態と分けて見てください。 |
 | `native_video` / `native_audio` | ネイティブAPI呼び出しの所要時間。下記ネイティブ区間を含みます。 |
 | `native_finalize` / `native_destroy` / `dispose` | Drain・末尾処理、破棄、Writer終了処理全体。 |
-| `native.stages.slot_wait` | 空きテクスチャを確保するまで（mutex取得とスロット探索を含む）。AMFだけでなく出力側の混雑でも増えます。 |
+| `native.stages.slot_wait` | 空きテクスチャを確保するまで（mutex取得とスロット探索を含む）。入力再利用ONでは未回収フレーム予算の空き待ちも含みます。AMFだけでなく出力側の混雑でも増えます。 |
 | `copy_resource_cpu` | `CopyResource`のCPU呼び出し時間。GPU上でコピーが完了するまでの時間ではありません。 |
 | `submit_input` / `input_retry_wait` | AMFへの投入APIと、投入待ち再試行のsleep時間。`input_retries`はINPUT_FULL / NEED_MORE_INPUTによる再試行数です。 |
+| `input_full_wait` | 実験的な入力満杯待機の指定・実効方式、通知数、待機回数と時間です。`input_release_notifications`は診断のみで起床条件ではありません。`output_notifications`で起床し、10 msで再確認します。通知数や再試行数が多いこと自体は高速化を意味しません。 |
 | `query_output` / `output_poll_wait` | 出力取得APIと、出力がまだないときのpoll待機。待機が長いだけでGPUが限界とは判断できません。 |
 | `output_mux_wait` / `bitstream_mux` | 回収スレッドのmuxロック待ちと、映像ビットストリームの解析・書き込みキュー投入。 |
 | `audio_write` | 音声API全体（muxロック・PCM処理・AAC処理を含む）。 |
 | `writer_sample` | 書き込みスレッドのサンプル書き込みと索引更新。ファイルロック待ちを含み、ストレージへの物理書き込み完了時間そのものではありません。 |
-| `slot_residence` | スロット確保から対応出力を処理して解放するまで。キュー、GPU変換・エンコード、回収側処理を含む滞留時間で、GPU単体の処理時間ではありません。 |
+| `slot_residence` | スロット確保から対応出力を処理するまで。入力再利用ONではtextureが先に返る場合もあり、物理占有時間は`input_recycling.input_residence`を使います。GPU単体の処理時間ではありません。 |
 | `finalize` / `mp4_finalize` | ネイティブ終了処理全体と、AAC flush・writer join・MP4末尾処理。ネストしています。 |
 
 各stageの`count` / `total_ms` / `mean_ms` / `max_ms`を確認します。区間は入れ子・非同期で重なるため、合計して全体時間や100%の内訳にしないでください。ネイティブ計測はAMF初期化完了後に開始し、Destroy直前にスナップショットを取得します。初期化・Destroy自体は管理側の指標で確認します。
+
+開発版の[出力回収待機の最適化](output-wait-optimization.md)では、`configuration.optimize_output_wait`が指定値、トップレベルの`output_wait`が実際の設定結果です。`query_output`にAMF内部の待機が含まれ得ます。`output_poll_wait`は従来のsleep、または早期リターン時の高精度タイマー待機です。ON/OFFで待ち時間の記録先が変わるので、この二項目だけの大小を高速化の根拠にしないでください。比較には全体時間と`slot_wait`、検証済みフレーム数を使います。
+
+開発版の[MF方式の入力再利用](mf-input-recycling.md)では、`configuration.recycle_input_after_release`が指定値、`input_recycling`が入力解放・出力回収の別々のカウンターです。`input_residence`と`slot_residence`の差から先行返却の余地を調べられます。`pending_outputs`は投入準備中を含むプラグイン内の未回収数であり、AMF内部キューの深さではありません。
+
+開発版の入力満杯待機実験では、`configuration.adaptive_input_wait`が指定値、`input_full_wait.effective_mode`が実効方式です。OFFは従来の`1 ms sleep`、ONは圧縮済み出力通知または10 ms fallbackまで待ちます。`input_full_wait.waits`は`native.input_retries`と対応します。実測ではpool 32で通知版の再試行が約6.4倍になった一方、全体速度の差はノイズ内でした。[条件と結果](benchmarks/2026-09-18-input-full-wait.md)
+
+開発版のMF方式NV12実験では、`configuration.mf_style_nv12`が指定値、`mf_style_nv12.active`が実効値です。`conversions` / `failures`はVideoProcessor変換数、`conversion_cpu`はCopyResourceとVideoProcessorBlt命令を発行したCPU wall-timeであり、GPU実行時間ではありません。`gpu_operations_per_frame=2`は所有RGBへのCopyResourceとNV12へのVideoProcessorBltを表します。[構造とRX 6800 XT実測](benchmarks/2026-09-18-mf-style-nv12.md)
+
+### テクスチャ増量の測定（開発版）
+
+`configuration.requested_pool_size`は要求値、`configuration.pool_size`は解像度から計算した予定枚数、`texture_pool.effective_size`はネイティブ側の実効枚数です。`texture_pool`は従来回収／入力解放回収の両方で取得できます。増量機能を古いネイティブDLLと混在させた場合は、黙って8枚に制限されないよう出力前にエラーにします。
+
+- `nominal_texture_bytes`: 幅×高さ×4×実効枚数。alignment、AMF内部、描画用texture等を含まない画素量で、実測VRAMではありません。
+- `peak_inputs_in_use`: 同時使用数の最大値。再利用ONでは入力解放、OFFでは圧縮出力回収までを数えます。
+- `input_exhaustion_count`: 借用開始時に全入力が使用中だった回数。ロック取得待ちの回数ではありません。
+- `output_budget_exhaustion_count`: 再利用ONで、借用開始時に未回収数の上限に達していた回数。入力枯渇と同時に増える場合があります。
+- `pending_output_limit`: OFFでは枚数と同じ、入力解放回収ONでは2倍です。枚数を変える比較はこの上限も変わるため、AMF内部キューの単独比較ではありません。
+
+枯渇回数の大小だけでは良し悪しを判断できません。例えば「毎フレーム短く待つ」方式は「数フレームごとに長く待つ」方式より回数が多くても速いことがあります。`slot_wait`の合計・最大と、全体時間を併せて確認してください。プール待ちが消えても`input_retry_wait`へ移動しただけの場合があります。
+
+増量は既定OFF相当（6枚）のままです。上限128枚、かつ9枚以上の増量を幅×高さ×4の目安1 GiBで制限します。従来の4〜8枚にはこの追加制限を適用しません。動的な無制限確保、設定の自動引き上げ、画質変更は行いません。
 
 ## どこが詰まっているかを考える
 

@@ -6,8 +6,14 @@ internal sealed class AmfSettings
     public int BitrateKbps { get; set; } = 12000;
     public AmfQuality Quality { get; set; } = AmfQuality.Balanced;
     public AmfRateControl RateControl { get; set; } = AmfRateControl.YouTubeRecommended;
-    public int TexturePoolSize { get; set; } = 6;
+    public int TexturePoolSize { get; set; } = 8;
     public bool EnableGpuDirectInput { get; set; }
+    public bool OptimizeOutputWait { get; set; } = true;
+    public bool RecycleInputAfterRelease { get; set; }
+    public bool AsyncSubmission { get; set; }
+    public bool DedicatedEncoderDevice { get; set; }
+    public bool AdaptiveInputWait { get; set; }
+    public bool MfStyleNv12 { get; set; }
     public bool EnableDebugLog { get; set; }
     public bool DiscardOutput { get; set; }
     public bool EnableProfiling { get; set; }

@@ -77,6 +77,13 @@
   <ItemGroup>
     <ClInclude Include="AmfNative.h" />
     <ClInclude Include="AmfProfiling.h" />
+    <ClInclude Include="AmfOutputWait.h" />
+    <ClInclude Include="AmfInputRecyclePool.h" />
+    <ClInclude Include="AmfTexturePoolPolicy.h" />
+    <ClInclude Include="AmfSubmissionQueue.h" />
+    <ClInclude Include="AmfDeviceBridge.h" />
+    <ClInclude Include="AmfInputWait.h" />
+    <ClInclude Include="AmfNv12Processor.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

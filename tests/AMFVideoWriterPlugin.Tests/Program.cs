@@ -22,6 +22,8 @@ internal static partial class Program
     {
         if (args.Length == 3 && args[0] == "--gpu")
             return RunGpuSmoke(Path.GetFullPath(args[1]), Path.GetFullPath(args[2]));
+        if (args.Length == 3 && args[0] == "--gpu-defaults")
+            return RunGpuSmoke(Path.GetFullPath(args[1]), Path.GetFullPath(args[2]), defaultsOnly: true);
         var root = Path.GetFullPath(args.Single());
         Directory.CreateDirectory(root);
         // Any attempt to initialize/copy/encode in discard mode must fail this test, even on GPU-less CI.
@@ -30,6 +32,12 @@ internal static partial class Program
 
         var defaults = new AmfSettings();
         RunGpuDirectContractTests(root);
+        RunOutputWaitTests(root);
+        RunPipelineTests(root);
+        RunInputRecyclingTests(root);
+        RunMfStyleNv12Tests(root);
+        RunTexturePoolTests();
+        RunOptimizationPresetTests(root);
         Check(!defaults.DiscardOutput && !defaults.EnableProfiling && !defaults.EnableDebugLog, "Diagnostics must be opt-in");
         Check(Marshal.SizeOf<NativeProfileSnapshot>() == 344, "Native profile ABI size");
         Check(Marshal.OffsetOf<NativeProfileSnapshot>(nameof(NativeProfileSnapshot.Metrics)).ToInt32() == 32, "Native metric alignment");

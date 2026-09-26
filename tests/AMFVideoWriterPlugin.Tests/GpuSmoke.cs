@@ -16,7 +16,7 @@ using FeatureLevel = Vortice.Direct3D.FeatureLevel;
 internal static partial class Program
 {
     // Actual managed writer -> P/Invoke -> AMF, without launching or modifying a YMM4 installation.
-    private static int RunGpuSmoke(string root, string nativePath)
+    private static int RunGpuSmoke(string root, string nativePath, bool defaultsOnly = false)
     {
         Directory.CreateDirectory(root);
         NativeLibrary.SetDllImportResolver(typeof(AmfVideoFileWriter).Assembly, (name, _, _) =>
@@ -46,15 +46,25 @@ internal static partial class Program
             context.Target = bitmap;
             foreach (var codec in new[] { AmfCodec.H264, AmfCodec.H265 })
             foreach (var enabled in new[] { false, true })
-            foreach (var gpuDirect in new[] { false, true })
+            foreach (var gpuDirect in defaultsOnly ? new[] { false } : new[] { false, true })
+            foreach (var optimizeWait in defaultsOnly ? new[] { true } : new[] { false, true })
+            foreach (var recycleInput in defaultsOnly ? new[] { false } : new[] { false, true })
+            foreach (var mfStyleNv12 in defaultsOnly ? new[] { false } : new[] { false, true })
             {
-                var caseName = (codec == AmfCodec.H264 ? "h264" : "hevc") + (enabled ? "-profile" : "-off") + (gpuDirect ? "-gpu-direct" : "-cpu-read");
+                var caseName = (codec == AmfCodec.H264 ? "h264" : "hevc") + (enabled ? "-profile" : "-off")
+                    + (gpuDirect ? "-gpu-direct" : "-cpu-read") + (optimizeWait ? "-wait-on" : "-wait-off")
+                    + (recycleInput ? "-recycle-on" : "-recycle-off")
+                    + (mfStyleNv12 ? "-mf-nv12-on" : "");
                 var caseRoot = Path.Combine(root, caseName);
                 Directory.CreateDirectory(caseRoot);
                 var path = Path.Combine(caseRoot, "output.mp4");
                 var info = new VideoInfo { Width = 640, Height = 360, FPS = 60, Hz = 48000 };
-                using (var writer = new AmfVideoFileWriter(path, info,
-                    new AmfSettings { Codec = codec, TexturePoolSize = 4, EnableProfiling = enabled, EnableGpuDirectInput = gpuDirect }))
+                var settings = defaultsOnly
+                    ? new AmfSettings { Codec = codec, EnableProfiling = enabled }
+                    : new AmfSettings { Codec = codec, TexturePoolSize = 4, EnableProfiling = enabled,
+                        EnableGpuDirectInput = gpuDirect, OptimizeOutputWait = optimizeWait,
+                        RecycleInputAfterRelease = recycleInput, MfStyleNv12 = mfStyleNv12 };
+                using (var writer = new AmfVideoFileWriter(path, info, settings))
                 {
                     Check(((IVideoFileWriter3)writer).IsGpuFrameSupported == gpuDirect, "Host input capability matches this case");
                     var samples = new float[1600]; // 800 stereo sample frames per video frame; silence is intentional.
@@ -85,6 +95,35 @@ internal static partial class Program
                 {
                     using var json = JsonDocument.Parse(File.ReadAllText(path + ".amf_profile.json"));
                     var report = json.RootElement;
+                    if (defaultsOnly)
+                    {
+                        Check(report.GetProperty("configuration").GetProperty("pool_size").GetInt32() == 8,
+                            "Default managed export requests eight textures");
+                        Check(report.GetProperty("texture_pool").GetProperty("effective_size").GetUInt32() == 8,
+                            "Default native export uses eight textures");
+                    }
+                    var recycling = report.GetProperty("input_recycling");
+                    Check(recycling.GetProperty("requested").GetBoolean() == recycleInput, "Input-recycling option crosses native ABI");
+                    Check(recycling.GetProperty("invalid_events").GetUInt64() == 0, "No stale/duplicate input events");
+                    if (recycleInput)
+                    {
+                        Check(recycling.GetProperty("input_releases").GetUInt64() == 120, "All managed input surfaces returned");
+                        Check(recycling.GetProperty("output_completions").GetUInt64() == 120, "All recycled-input outputs completed");
+                        Check(recycling.GetProperty("peak_inputs_in_use").GetUInt32() <= 4, "Input texture count remains bounded");
+                        Check(recycling.GetProperty("peak_pending_outputs").GetUInt32() <= 8, "Pending output count remains bounded");
+                    }
+                    var wait = report.GetProperty("output_wait");
+                    Check(wait.GetProperty("requested").GetBoolean() == optimizeWait, "Wait option crosses the native ABI");
+                    Check(wait.GetProperty("query_timeout_ms").GetUInt32() is 0 or 10, "Native wait is finite");
+                    if (!optimizeWait) Check(wait.GetProperty("reason").GetString() == "disabled", "Legacy wait remains unchanged");
+                    else Check(wait.GetProperty("reason").GetString() is "enabled" or "unsupported" or "capability_unavailable"
+                        or "property_rejected" or "readback_failed" or "readback_mismatch", "Optimization or explicit safe fallback");
+                    var mfStyle = report.GetProperty("mf_style_nv12");
+                    Check(mfStyle.GetProperty("requested").GetBoolean() == mfStyleNv12, "MF-style NV12 option crosses native ABI");
+                    Check(mfStyle.GetProperty("active").GetBoolean() == mfStyleNv12, "MF-style NV12 active state matches request");
+                    Check(mfStyle.GetProperty("conversions").GetUInt64() == (mfStyleNv12 ? 120UL : 0UL),
+                        "MF-style NV12 conversion count matches submitted frames");
+                    Check(mfStyle.GetProperty("failures").GetUInt64() == 0, "MF-style NV12 has no failed conversions");
                     Check(report.GetProperty("input_delivery_path").GetString() == (gpuDirect ? "gpu_direct_IVideoFileWriter3" : "cpu_read_bitmap_IVideoFileWriter2"), "Profile records the selected input path");
                     Check(report.GetProperty("status").GetString() == "writer_disposed", "Managed completion without errors");
                     Check(report.GetProperty("output_finalized").GetBoolean(), "Native finalization propagated");

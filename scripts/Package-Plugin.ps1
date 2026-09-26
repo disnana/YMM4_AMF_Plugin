@@ -26,7 +26,7 @@ if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $artifactsRoot 'release'
 }
 $releaseRoot = [System.IO.Path]::GetFullPath($OutputDirectory)
-$stagingRoot = Join-Path $artifactsRoot 'ymme-staging'
+$stagingRoot = Join-Path $artifactsRoot ('ymme-staging/' + [Guid]::NewGuid().ToString('N'))
 $pluginFolder = Join-Path $stagingRoot 'AMFVideoWriterPlugin'
 $packageName = "YMM4-Radeon-AMF-v$version.ymme"
 $packagePath = Join-Path $releaseRoot $packageName
@@ -42,16 +42,15 @@ function Assert-UnderArtifacts([string]$Path) {
 
 Assert-UnderArtifacts $releaseRoot
 Assert-UnderArtifacts $stagingRoot
+foreach ($existing in @($packagePath, $zipPath, "$packagePath.sha256")) {
+    if (Test-Path -LiteralPath $existing) {
+        throw "Package output already exists; choose a new version or output directory: $existing"
+    }
+}
 
 & (Join-Path $PSScriptRoot 'Build.ps1') -Configuration $Configuration -IncludePlugin -Ymm4Directory $Ymm4Directory
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."
-}
-
-foreach ($path in @($stagingRoot, $releaseRoot)) {
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Recurse -Force
-    }
 }
 
 New-Item -ItemType Directory -Path $pluginFolder -Force | Out-Null
@@ -65,6 +64,10 @@ $packageFiles = @(
     @{ Source = (Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.txt'); Name = 'THIRD_PARTY_NOTICES.txt' },
     @{ Source = $versionFile; Name = 'VERSION' }
 )
+$releaseNotes = Join-Path $repositoryRoot "docs/release-notes/v$version.md"
+if (Test-Path -LiteralPath $releaseNotes -PathType Leaf) {
+    $packageFiles += @{ Source = $releaseNotes; Name = 'RELEASE_NOTES.md' }
+}
 
 foreach ($file in $packageFiles) {
     if (-not (Test-Path -LiteralPath $file.Source -PathType Leaf)) {
