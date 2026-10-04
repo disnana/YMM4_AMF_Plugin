@@ -1059,7 +1059,7 @@ namespace
         buffer.EndBox(sttsStart);
     }
 
-    void AppendAudioTrak(Mp4Buffer& moov, const EncoderState* state, uint32_t trackId)
+    void AppendAudioTrak(Mp4Buffer& moov, const EncoderState* state, uint32_t trackId, uint32_t movieTimescale)
     {
         const uint32_t timescale = static_cast<uint32_t>(state->audioSampleRate);
         const uint64_t duration = state->audioSampleTotal;
@@ -1074,7 +1074,9 @@ namespace
         moov.WriteU32(0);
         moov.WriteU32(trackId);
         moov.WriteU32(0);
-        moov.WriteU32(static_cast<uint32_t>(duration));
+        // tkhd uses the movie clock; mdhd and stts below use the audio clock.
+        const uint64_t trackDuration = duration * movieTimescale / timescale;
+        moov.WriteU32(static_cast<uint32_t>(trackDuration));
         moov.WriteU32(0);
         moov.WriteU32(0);
         moov.WriteU16(0);
@@ -1423,7 +1425,7 @@ namespace
 
         if (!state->audioSampleSizes.empty() && !state->audioSpecificConfig.empty())
         {
-            AppendAudioTrak(moov, state, 2);
+            AppendAudioTrak(moov, state, 2, timescale);
         }
         moov.EndBox(moovStart);
 

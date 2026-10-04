@@ -41,6 +41,7 @@ if ($Suite -in @('Unit', 'All')) {
     if ($LASTEXITCODE -eq 0) { throw 'CLI unexpectedly accepted an invalid pool size.' }
     Write-Host 'PowerShell parse and CLI contract checks: passed'
     & (Join-Path $repositoryRoot 'tests/Test-ExportQuality.ps1')
+    & (Join-Path $repositoryRoot 'tests/Test-Mp4Timing.ps1')
     & $bench profile-self-test
     if ($LASTEXITCODE -ne 0) { throw 'Native profiling counter checks failed.' }
     & $bench output-wait-self-test

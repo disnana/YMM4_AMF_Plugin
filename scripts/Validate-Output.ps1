@@ -30,6 +30,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Mp4Timing.Common.ps1')
+if ($ExpectAudio) {
+    $mp4AudioTiming = Assert-Mp4AudioTrackTiming -Path $Output
+}
 
 function Assert-Condition {
     param(
@@ -155,6 +159,8 @@ $run.validation.frame_order = 'passed'
 $run.validation.color = 'passed_bt709_limited_metadata'
 $run.validation.audio_sync = if ($ExpectAudio) { 'passed_duration_only' } else { 'not_requested' }
 if ($ExpectAudio) {
+    $run.validation | Add-Member -NotePropertyName mp4_audio_timing `
+        -NotePropertyValue $mp4AudioTiming -Force
     $run.validation | Add-Member -NotePropertyName audio_duration_delta_ms `
         -NotePropertyValue ([Math]::Round($audioDurationDeltaMs, 3)) -Force
 }
